@@ -1,5 +1,5 @@
 """
-공사현장 명칭 일원화 검토 프로그램 v3.4 (GUI)
+공사현장 명칭 일원화 검토 프로그램 v3.5 (GUI)
 """
 
 import os
@@ -29,7 +29,7 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("공사현장 명칭 일원화 검토 프로그램 v3.4")
+        self.title("공사현장 명칭 일원화 검토 프로그램 v3.5")
         self.geometry("1150x780")
         self.minsize(950, 650)
 
@@ -61,7 +61,7 @@ class App(ctk.CTk):
         ).pack(side="left", padx=15, pady=12)
 
         ctk.CTkLabel(
-            top, text="v3.4  |  HWP · PDF · XLSX · DOCX · CSV  ",
+            top, text="v3.5  |  HWP · PDF · XLSX · DOCX · CSV  ",
             font=ctk.CTkFont(size=12), text_color="#B0C4DE"
         ).pack(side="right", padx=15)
 
@@ -128,9 +128,9 @@ class App(ctk.CTk):
 
         self.drop_hint_label = ctk.CTkLabel(
             lf,
-            text="파일을 여기에 드래그하거나\n[파일 추가] 버튼을 사용하세요",
-            font=ctk.CTkFont(size=12),
-            text_color="#AAAAAA",
+            text="📂 파일을 여기에 드래그하거나\n[파일 추가] 버튼을 사용하세요",
+            font=ctk.CTkFont(size=13),
+            text_color="#999999",
             justify="center"
         )
         self.drop_hint_label.place(relx=0.5, rely=0.5, anchor="center")
@@ -298,33 +298,52 @@ class App(ctk.CTk):
     @staticmethod
     def _decode_drop_path(item) -> str:
         if isinstance(item, bytes):
-            for enc in ("utf-8", "cp949", "euc-kr"):
+            for enc in ("utf-8", "cp949", "euc-kr", "mbcs"):
                 try:
                     return item.decode(enc)
-                except UnicodeDecodeError:
+                except (UnicodeDecodeError, LookupError):
                     continue
-            return item.decode("utf-8", errors="ignore")
+            return ""
         return str(item)
 
     def _on_drop_files(self, file_list):
+        """windnd 콜백 - 메인 스레드로 위임"""
+        self.after(0, lambda fl=file_list: self._process_dropped_files(fl))
+
+    def _process_dropped_files(self, file_list):
+        """메인 스레드에서 드롭된 파일 처리"""
         if self.is_reviewing:
             return
 
-        for item in file_list:
-            fp = self._decode_drop_path(item).strip()
-            if not fp:
-                continue
+        try:
+            for item in file_list:
+                fp = self._decode_drop_path(item)
+                if fp is None:
+                    continue
 
-            fp = fp.strip('"').strip("'")
-            if fp.startswith("{") and fp.endswith("}"):
-                fp = fp[1:-1]
-            ext = os.path.splitext(fp)[1].lower()
+                fp = fp.strip().strip('"').strip("'")
+                if not fp:
+                    continue
 
-            if ext in SUPPORTED_EXTENSIONS and fp not in self.file_paths:
+                if fp.startswith("{") and fp.endswith("}"):
+                    fp = fp[1:-1].strip()
+
+                if not os.path.isfile(fp):
+                    continue
+
+                ext = os.path.splitext(fp)[1].lower()
+                if ext not in SUPPORTED_EXTENSIONS:
+                    continue
+
+                if fp in self.file_paths:
+                    continue
+
                 self.file_paths.append(fp)
                 self.file_listbox.insert(tk.END, os.path.basename(fp))
 
-        self._refresh_count()
+            self._refresh_count()
+        except Exception as e:
+            print(f"드래그 드롭 처리 오류: {e}")
 
     # ── UI 잠금 ──
     def _lock_ui(self):
