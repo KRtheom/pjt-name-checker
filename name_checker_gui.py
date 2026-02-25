@@ -1,5 +1,5 @@
 """
-공사현장 명칭 일원화 검토 프로그램 v3.6.1 (GUI)
+공사현장 명칭 일원화 검토 프로그램 v3.7 (GUI)
 """
 
 import os
@@ -7,6 +7,7 @@ import queue
 import sys
 import threading
 from datetime import datetime
+from time import perf_counter
 
 import customtkinter as ctk
 import tkinter as tk
@@ -31,7 +32,7 @@ from engine import (
 )
 
 MASTER_DB_URL = "https://www.krindus.co.kr/resources/upload/itdata/MasterDB.csv"
-APP_VERSION = "v3.6.1"
+APP_VERSION = "v3.7"
 
 
 def resource_path(relative_path):
@@ -499,6 +500,7 @@ class App(ctk.CTk):
         try:
             total = len(files)
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            started_at = perf_counter()
 
             self._log("=" * 58)
             self._log(
@@ -547,7 +549,11 @@ class App(ctk.CTk):
                     self._log(sep)
 
                     for d in ng_items:
-                        self._log(f" NG | {d['input']}")
+                        location = d.get("location", "")
+                        if location:
+                            self._log(f" NG | {d['input']}  | 위치: {location}")
+                        else:
+                            self._log(f" NG | {d['input']}")
 
                         issue = d.get("issue", "")
                         suggestion = d.get("suggestion", "")
@@ -599,18 +605,19 @@ class App(ctk.CTk):
                 self._set_progress((idx + 1) / total)
 
             # 요약
+            elapsed = perf_counter() - started_at
             self._log("\n" + "=" * 58)
-            self._log("  검토 완료!")
+            self._log(f"  검토 완료!  |  소요시간: {elapsed:.1f}s")
             self._log(
                 f"  발견 {grand_total}개  |  "
-                f"일치 {grand_match}개 (참고)  |  "
+                f"일치 {grand_match}개  |  "
                 f"불일치 {grand_mismatch}개"
             )
             self._log("=" * 58)
 
             self._set_status(
                 f"검토 완료  |  발견 {grand_total}개 : "
-                f"불일치 {grand_mismatch}개"
+                f"불일치 {grand_mismatch}개  |  {elapsed:.1f}s"
             )
 
         except Exception as e:

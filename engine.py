@@ -4,6 +4,7 @@ engine.py - 공사명칭 검토 엔진 v3.0
 
 import os
 import re
+import bisect
 from datetime import datetime
 from difflib import SequenceMatcher
 
@@ -32,7 +33,7 @@ def extract_from_xlsx(filepath: str) -> list:
     return texts
 
 
-def extract_from_pdf(filepath: str) -> list:
+def extract_from_pdf(filepath: str, include_tables: bool = False) -> list:
     import pdfplumber
     texts = []
     with pdfplumber.open(filepath) as pdf:
@@ -43,17 +44,18 @@ def extract_from_pdf(filepath: str) -> list:
                     line = line.strip()
                     if line:
                         texts.append((f"P{pn} L{ln}", line))
-            tables = page.extract_tables()
-            if tables:
-                for ti, table in enumerate(tables, 1):
-                    for ri, row in enumerate(table, 1):
-                        if row:
-                            for ci, cv in enumerate(row, 1):
-                                if cv and str(cv).strip():
-                                    texts.append(
-                                        (f"P{pn} 표{ti}({ri},{ci})",
-                                         str(cv).strip())
-                                    )
+            if include_tables:
+                tables = page.extract_tables()
+                if tables:
+                    for ti, table in enumerate(tables, 1):
+                        for ri, row in enumerate(table, 1):
+                            if row:
+                                for ci, cv in enumerate(row, 1):
+                                    if cv and str(cv).strip():
+                                        texts.append(
+                                            (f"P{pn} 표{ti}({ri},{ci})",
+                                             str(cv).strip())
+                                        )
     return texts
 
 
@@ -125,14 +127,16 @@ def extract_from_csv(filepath: str) -> list:
     raise ValueError(f"CSV 인코딩 인식 불가: {filepath}")
 
 
-def extract_text_from_file(filepath: str) -> list:
+def extract_text_from_file(filepath: str, include_pdf_tables: bool = False) -> list:
     ext = os.path.splitext(filepath)[1].lower()
+    if ext == ".pdf":
+        return extract_from_pdf(filepath, include_tables=include_pdf_tables)
+
     dispatch = {
-        '.xlsx': extract_from_xlsx,
-        '.pdf':  extract_from_pdf,
-        '.docx': extract_from_docx,
-        '.hwp':  extract_from_hwp,
-        '.csv':  extract_from_csv,
+        ".xlsx": extract_from_xlsx,
+        ".docx": extract_from_docx,
+        ".hwp": extract_from_hwp,
+        ".csv": extract_from_csv,
     }
     func = dispatch.get(ext)
     if func is None:
@@ -420,6 +424,29 @@ class NameMatcher:
             if suffix_match:
                 self.master_suffixes.add(suffix_match.group())
 
+        self.bare_names = list(self.bare_to_official.keys())
+        self.min_bare_length = min((len(name) for name in self.bare_names),
+                                   default=0)
+        sorted_bares = sorted(self.bare_names, key=len, reverse=True)
+        sorted_officials = sorted(self.master_names, key=len, reverse=True)
+        self._bare_pattern = self._compile_alternation(
+            sorted_bares, with_token_boundary=True
+        )
+        self._official_pattern = self._compile_alternation(sorted_officials)
+        self._similarity_cache = {}
+
+    @staticmethod
+    def _compile_alternation(items: list, with_token_boundary: bool = False):
+        escaped_items = [re.escape(item) for item in items if item]
+        if not escaped_items:
+            return re.compile(r"(?!x)x")
+        body = "|".join(escaped_items)
+        if with_token_boundary:
+            body = (
+                rf'(?<![0-9A-Za-z가-힣])(?:{body})(?![0-9A-Za-z가-힣])'
+            )
+        return re.compile(body)
+
     @staticmethod
     def _remove_prefix(name: str) -> str:
         """앞쪽 접두어 (민간), (CM) 등 제거"""
@@ -499,6 +526,8 @@ class NameMatcher:
         """텍스트에서 마스터DB와 관련된 모든 문자열을 찾아냄"""
         found = []
         text = text.strip()
+        if len(text) < 3:
+            return []
         if self._is_excluded(text):
             return []
 
@@ -512,17 +541,20 @@ class NameMatcher:
         norm = self._normalize(text)
         if norm != text and norm in self.bare_to_official:
             return [text]  # 원본 텍스트를 반환 (정규화 전 형태)
+        if len(text) < self.min_bare_length:
+            return []
 
         # (C) 텍스트 안에 공식명칭이 포함
-        for official in self.master_names:
-            if official in text and official not in found:
+        for match in self._official_pattern.finditer(text):
+            official = match.group(0)
+            if official not in found:
                 found.append(official)
 
         # (D) 텍스트 안에 순수명칭이 포함
-        for bare, officials in self.bare_to_official.items():
-            if len(bare) < 4:
-                continue
-            if not self._contains_bare_token(text, bare):
+        for match in self._bare_pattern.finditer(text):
+            bare = match.group(0)
+            officials = self.bare_to_official.get(bare)
+            if not officials:
                 continue
 
             already = any(off in found for off in officials)
@@ -555,6 +587,10 @@ class NameMatcher:
 
     def _best_similarity(self, text: str):
         """마스터 순수명칭들과 유사도 비교, 최고점 반환"""
+        cached = self._similarity_cache.get(text)
+        if cached is not None:
+            return cached
+
         best_name = None
         best_score = 0.0
         for bare, officials in self.bare_to_official.items():
@@ -562,7 +598,9 @@ class NameMatcher:
             if score > best_score:
                 best_score = score
                 best_name = officials[0]  # 대표 공식명칭
-        return best_name, best_score
+        result = (best_name, best_score)
+        self._similarity_cache[text] = result
+        return result
 
     def check(self, text: str) -> dict:
         """
@@ -722,6 +760,37 @@ class ReviewEngine:
     def __init__(self, matcher: NameMatcher):
         self.matcher = matcher
 
+    @staticmethod
+    def _build_full_text_with_offsets(text_items: list) -> tuple[str, list, list]:
+        parts = []
+        starts = []
+        offsets = []
+        cursor = 0
+
+        for location, raw_text in text_items:
+            text = str(raw_text).strip()
+            if not text:
+                continue
+
+            parts.append(text)
+            start = cursor
+            end = start + len(text)
+            starts.append(start)
+            offsets.append((start, end, location, text))
+            cursor = end + 1  # '\n'
+
+        return "\n".join(parts), starts, offsets
+
+    @staticmethod
+    def _find_offset_index(starts: list, offsets: list, position: int) -> int:
+        idx = bisect.bisect_right(starts, position) - 1
+        if idx < 0 or idx >= len(offsets):
+            return -1
+        start, end, _, _ = offsets[idx]
+        if not (start <= position < end):
+            return -1
+        return idx
+
     def review_file(self, filepath: str) -> dict:
         filename = os.path.basename(filepath)
         try:
@@ -737,26 +806,60 @@ class ReviewEngine:
         checked_results = {}
         checked_locations = {}
 
-        for location, text in text_items:
-            candidates = self.matcher.find_all_in_text(text)
-            for candidate in candidates:
-                if candidate in checked_results:
-                    existing = checked_results[candidate]
-                    # 파일당 1회 검출은 유지하되, 불일치 항목은 위치를 누적 기록
-                    if existing["status"] == "불일치":
-                        locs = checked_locations[candidate]
-                        if location not in locs:
-                            locs.append(location)
-                            existing["location"] = ", ".join(locs)
-                    continue
+        def consume_candidate(candidate: str, location: str):
+            if candidate in checked_results:
+                existing = checked_results[candidate]
+                if existing["status"] == "불일치":
+                    locs = checked_locations[candidate]
+                    if location not in locs:
+                        locs.append(location)
+                        existing["location"] = ", ".join(locs)
+                return
 
-                check_result = self.matcher.check(candidate)
-                if check_result is None:
+            check_result = self.matcher.check(candidate)
+            if check_result is None:
+                return
+            check_result["location"] = location
+            results.append(check_result)
+            checked_results[candidate] = check_result
+            checked_locations[candidate] = [location]
+
+        full_text, starts, offsets = self._build_full_text_with_offsets(text_items)
+        if full_text:
+            match_events = []
+            matched_offset_indices = set()
+            for match in self.matcher._official_pattern.finditer(full_text):
+                idx = self._find_offset_index(starts, offsets, match.start())
+                if idx < 0:
                     continue
-                check_result["location"] = location
-                results.append(check_result)
-                checked_results[candidate] = check_result
-                checked_locations[candidate] = [location]
+                matched_offset_indices.add(idx)
+                location = offsets[idx][2]
+                match_events.append((match.start(), 0, match.group(0), location))
+
+            for match in self.matcher._bare_pattern.finditer(full_text):
+                idx = self._find_offset_index(starts, offsets, match.start())
+                if idx < 0:
+                    continue
+                matched_offset_indices.add(idx)
+                _, _, location, source_text = offsets[idx]
+                bare = match.group(0)
+                prefixed = self.matcher._extract_prefixed_candidate(source_text, bare)
+                candidate = prefixed if prefixed else bare
+                match_events.append((match.start(), 1, candidate, location))
+
+            match_events.sort(key=lambda item: (item[0], item[1]))
+
+            for _, _, candidate, location in match_events:
+                consume_candidate(candidate, location)
+
+            # 정규식 미검출 조각에 대해서만 보조 탐색(유사도 포함) 수행
+            for idx, (_, _, location, source_text) in enumerate(offsets):
+                if idx in matched_offset_indices:
+                    continue
+                if len(source_text) > 80:
+                    continue
+                for candidate in self.matcher.find_all_in_text(source_text):
+                    consume_candidate(candidate, location)
 
         matched = sum(1 for r in results if r["status"] == "일치")
         mismatched = sum(1 for r in results if r["status"] == "불일치")
@@ -814,7 +917,7 @@ def save_excel_report(all_results: list, output_path: str,
     ws['A2'].value = (
         f"파일 {len(all_results)}개  |  "
         f"발견 {t_found}개  |  "
-        f"일치 {t_match}개 (참고)  |  "
+        f"일치 {t_match}개  |  "
         f"불일치 {t_mis}개"
     )
     ws['A2'].font = Font(size=11, name="맑은 고딕", bold=True)
