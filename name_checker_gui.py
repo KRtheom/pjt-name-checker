@@ -364,6 +364,9 @@ class App(ctk.CTk):
 
     # ── 리포트 ──
     def _save_report(self):
+        if self.is_reviewing:
+            return
+
         if not self.all_results:
             messagebox.showwarning(
                 "알림", "먼저 검토를 실행해주세요."

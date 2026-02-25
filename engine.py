@@ -388,6 +388,28 @@ class NameMatcher:
                     matches.append(off)
         return matches
 
+    @staticmethod
+    def _contains_bare_token(text: str, bare: str) -> bool:
+        """순수명칭이 더 긴 토큰의 부분문자열이 아닌지 경계 포함 확인"""
+        token_re = re.compile(
+            rf'(?<![0-9A-Za-z가-힣]){re.escape(bare)}(?![0-9A-Za-z가-힣])'
+        )
+        return bool(token_re.search(text))
+
+    @staticmethod
+    def _extract_prefixed_candidate(text: str, bare: str):
+        """
+        텍스트 안에서 '(접두어)순수명칭' 형태를 찾아 원문 후보로 반환.
+        더 긴 토큰의 부분문자열 매칭은 제외한다.
+        """
+        prefixed_re = re.compile(
+            rf'(\([^)]+\)\s*{re.escape(bare)})(?![0-9A-Za-z가-힣])'
+        )
+        m = prefixed_re.search(text)
+        if m:
+            return m.group(1).strip()
+        return None
+
     def find_all_in_text(self, text: str) -> list:
         """텍스트에서 마스터DB와 관련된 모든 문자열을 찾아냄"""
         found = []
@@ -415,10 +437,21 @@ class NameMatcher:
         for bare, officials in self.bare_to_official.items():
             if len(bare) < 4:
                 continue
-            if bare not in text:
+            if not self._contains_bare_token(text, bare):
                 continue
+
             already = any(off in found for off in officials)
-            if not already and bare not in found:
+            if already:
+                continue
+
+            # '(접두어)순수명칭'이 있으면 bare 단독 추가를 피하고 원문 후보 유지
+            prefixed = self._extract_prefixed_candidate(text, bare)
+            if prefixed:
+                if prefixed not in found:
+                    found.append(prefixed)
+                continue
+
+            if bare not in found:
                 found.append(bare)
 
         # (E) 포함 관계 또는 유사도 매칭
@@ -484,12 +517,33 @@ class NameMatcher:
                     "issue": reason
                 }
             else:
+                # 방어로직: STEP0에서 걸리지 않았더라도 공식명칭 완전일치면 일치
+                for off in officials:
+                    if text == off:
+                        return {
+                            "input": text, "status": "일치",
+                            "suggestion": off, "issue": ""
+                        }
+
                 # 접두어가 있으면 접두어로 특정 시도
                 if has_prefix:
+                    matched_official = None
                     for off in officials:
                         if off == input_prefix + normalized:
-                            # 접두어+순수명칭 일치 → 이미 STEP0에서 걸림
-                            pass
+                            matched_official = off
+                            break
+
+                    # 접두어+순수명칭이 특정되면 해당 공식명칭 기준으로 사유 생성
+                    if matched_official:
+                        reason = self._describe_mismatch(
+                            text, normalized, input_prefix, matched_official
+                        )
+                        return {
+                            "input": text, "status": "불일치",
+                            "suggestion": matched_official,
+                            "issue": reason
+                        }
+
                     # 접두어 불일치
                     return {
                         "input": text, "status": "불일치",
@@ -507,16 +561,21 @@ class NameMatcher:
         containing = self._find_containing_matches(normalized)
         if containing:
             if len(containing) == 1:
-                return {
-                    "input": text, "status": "불일치",
-                    "suggestion": containing[0],
-                    "issue": f"명칭 불완전 → 공식: {containing[0]}"
-                }
+                candidate_bare = self._remove_prefix(containing[0])
+                # 예: 성남복정1A1 -> 성남복정1A 는 불완전보다 오탈자에 가까움
+                likely_typo = (
+                    normalized.startswith(candidate_bare)
+                    and len(normalized) - len(candidate_bare) <= 1
+                )
+                if not likely_typo:
+                    return {
+                        "input": text, "status": "불일치",
+                        "suggestion": containing[0],
+                        "issue": f"명칭 불완전 → 공식: {containing[0]}"
+                    }
             else:
                 display = "\n".join(
-                    [f"  ① {c}" if i == 0
-                     else f"  {'②③④⑤⑥⑦⑧⑨⑩'[min(i,9)]} {c}"
-                     for i, c in enumerate(containing)]
+                    [f"  {i + 1}. {c}" for i, c in enumerate(containing)]
                 )
                 return {
                     "input": text, "status": "불일치",
@@ -590,19 +649,29 @@ class ReviewEngine:
             }
 
         results = []
-        already_checked = set()
+        checked_results = {}
+        checked_locations = {}
 
         for location, text in text_items:
             candidates = self.matcher.find_all_in_text(text)
             for candidate in candidates:
-                if candidate in already_checked:
+                if candidate in checked_results:
+                    existing = checked_results[candidate]
+                    # 파일당 1회 검출은 유지하되, 불일치 항목은 위치를 누적 기록
+                    if existing["status"] == "불일치":
+                        locs = checked_locations[candidate]
+                        if location not in locs:
+                            locs.append(location)
+                            existing["location"] = ", ".join(locs)
                     continue
-                already_checked.add(candidate)
+
                 check_result = self.matcher.check(candidate)
                 if check_result is None:
                     continue
                 check_result["location"] = location
                 results.append(check_result)
+                checked_results[candidate] = check_result
+                checked_locations[candidate] = [location]
 
         matched = sum(1 for r in results if r["status"] == "일치")
         mismatched = sum(1 for r in results if r["status"] == "불일치")
