@@ -1,5 +1,5 @@
 """
-공사현장 명칭 일원화 검토 프로그램 v3.0 (GUI)
+공사현장 명칭 일원화 검토 프로그램 v3.4 (GUI)
 """
 
 import os
@@ -9,6 +9,11 @@ from datetime import datetime
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+try:
+    import windnd
+except ImportError:
+    windnd = None
 
 from engine import (
     SUPPORTED_EXTENSIONS,
@@ -24,7 +29,7 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("공사현장 명칭 일원화 검토 프로그램 v3.0")
+        self.title("공사현장 명칭 일원화 검토 프로그램 v3.4")
         self.geometry("1150x780")
         self.minsize(950, 650)
 
@@ -56,7 +61,7 @@ class App(ctk.CTk):
         ).pack(side="left", padx=15, pady=12)
 
         ctk.CTkLabel(
-            top, text="v3.0  |  HWP · PDF · XLSX · DOCX  ",
+            top, text="v3.4  |  HWP · PDF · XLSX · DOCX · CSV  ",
             font=ctk.CTkFont(size=12), text_color="#B0C4DE"
         ).pack(side="right", padx=15)
 
@@ -77,20 +82,35 @@ class App(ctk.CTk):
         bf = ctk.CTkFrame(left, fg_color="transparent")
         bf.pack(fill="x", padx=10)
 
-        ctk.CTkButton(bf, text="파일 추가", width=105,
-                       command=self._add_files
-                       ).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(bf, text="폴더 추가", width=105,
-                       command=self._add_folder
-                       ).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(bf, text="선택 삭제", width=90,
-                       fg_color="#6C757D", hover_color="#5A6268",
-                       command=self._remove_selected
-                       ).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(bf, text="전체 삭제", width=80,
-                       fg_color="#DC3545", hover_color="#C82333",
-                       command=self._clear_files
-                       ).pack(side="left")
+        bf.grid_columnconfigure((0, 1), weight=1)
+
+        self.add_file_btn = ctk.CTkButton(
+            bf, text="파일 추가", width=150, height=32,
+            command=self._add_files
+        )
+        self.add_file_btn.grid(row=0, column=0, padx=4, pady=2, sticky="ew")
+
+        self.add_folder_btn = ctk.CTkButton(
+            bf, text="폴더 추가", width=150, height=32,
+            command=self._add_folder
+        )
+        self.add_folder_btn.grid(row=0, column=1, padx=4, pady=2, sticky="ew")
+
+        self.remove_selected_btn = ctk.CTkButton(
+            bf, text="선택 삭제", width=150, height=32,
+            fg_color="#6C757D", hover_color="#5A6268", text_color="white",
+            command=self._remove_selected
+        )
+        self.remove_selected_btn.grid(
+            row=1, column=0, padx=4, pady=2, sticky="ew"
+        )
+
+        self.clear_files_btn = ctk.CTkButton(
+            bf, text="전체 삭제", width=150, height=32,
+            fg_color="#DC3545", hover_color="#C82333", text_color="white",
+            command=self._clear_files
+        )
+        self.clear_files_btn.grid(row=1, column=1, padx=4, pady=2, sticky="ew")
 
         lf = ctk.CTkFrame(left, fg_color="transparent")
         lf.pack(fill="both", expand=True, padx=10, pady=8)
@@ -106,10 +126,35 @@ class App(ctk.CTk):
         self.file_listbox.pack(fill="both", expand=True)
         sb.config(command=self.file_listbox.yview)
 
+        self.drop_hint_label = ctk.CTkLabel(
+            lf,
+            text="파일을 여기에 드래그하거나\n[파일 추가] 버튼을 사용하세요",
+            font=ctk.CTkFont(size=12),
+            text_color="#AAAAAA",
+            justify="center"
+        )
+        self.drop_hint_label.place(relx=0.5, rely=0.5, anchor="center")
+
+        if windnd is not None:
+            try:
+                windnd.hook_dropfiles(self.file_listbox, func=self._on_drop_files)
+                windnd.hook_dropfiles(lf, func=self._on_drop_files)
+                windnd.hook_dropfiles(self.drop_hint_label, func=self._on_drop_files)
+            except Exception:
+                pass
+
         self.count_label = ctk.CTkLabel(
             left, text="파일 0개", font=ctk.CTkFont(size=11)
         )
-        self.count_label.pack(padx=10, pady=(0, 10), anchor="w")
+        self.count_label.pack(padx=10, pady=(0, 2), anchor="w")
+
+        self.support_label = ctk.CTkLabel(
+            left,
+            text="지원 형식: HWP · PDF · XLSX · DOCX · CSV",
+            font=ctk.CTkFont(size=10),
+            text_color="gray"
+        )
+        self.support_label.pack(padx=10, pady=(0, 5), anchor="w")
 
         # 우측
         right = ctk.CTkFrame(main)
@@ -159,14 +204,25 @@ class App(ctk.CTk):
         )
         self.review_btn.pack(side="right")
 
+        self.sync_btn = ctk.CTkButton(
+            bottom, text="DB 동기화",
+            width=130, height=38,
+            fg_color="#FF8C00", hover_color="#E07B00", text_color="white",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._sync_db
+        )
+        self.sync_btn.pack(side="right", padx=(0, 8))
+
+        self._refresh_count()
+
     # ── 파일 관리 ──
     def _add_files(self):
         if self.is_reviewing:
             return
         types = [
-            ("지원 형식", "*.hwp *.pdf *.xlsx *.docx"),
+            ("지원 형식", "*.hwp *.pdf *.xlsx *.docx *.csv"),
             ("HWP", "*.hwp"), ("PDF", "*.pdf"),
-            ("Excel", "*.xlsx"), ("Word", "*.docx"),
+            ("Excel", "*.xlsx"), ("Word", "*.docx"), ("CSV", "*.csv"),
         ]
         paths = filedialog.askopenfilenames(
             title="파일 선택", filetypes=types
@@ -222,20 +278,66 @@ class App(ctk.CTk):
         )
 
     def _refresh_count(self):
+        count = len(self.file_paths)
         self.count_label.configure(
-            text=f"파일 {len(self.file_paths)}개"
+            text=f"파일 {count}개"
         )
+        if count == 0:
+            self._show_drop_hint()
+        else:
+            self._hide_drop_hint()
+
+    def _show_drop_hint(self):
+        if hasattr(self, "drop_hint_label"):
+            self.drop_hint_label.place(relx=0.5, rely=0.5, anchor="center")
+
+    def _hide_drop_hint(self):
+        if hasattr(self, "drop_hint_label"):
+            self.drop_hint_label.place_forget()
+
+    @staticmethod
+    def _decode_drop_path(item) -> str:
+        if isinstance(item, bytes):
+            for enc in ("utf-8", "cp949", "euc-kr"):
+                try:
+                    return item.decode(enc)
+                except UnicodeDecodeError:
+                    continue
+            return item.decode("utf-8", errors="ignore")
+        return str(item)
+
+    def _on_drop_files(self, file_list):
+        if self.is_reviewing:
+            return
+
+        for item in file_list:
+            fp = self._decode_drop_path(item).strip()
+            if not fp:
+                continue
+
+            fp = fp.strip('"').strip("'")
+            if fp.startswith("{") and fp.endswith("}"):
+                fp = fp[1:-1]
+            ext = os.path.splitext(fp)[1].lower()
+
+            if ext in SUPPORTED_EXTENSIONS and fp not in self.file_paths:
+                self.file_paths.append(fp)
+                self.file_listbox.insert(tk.END, os.path.basename(fp))
+
+        self._refresh_count()
 
     # ── UI 잠금 ──
     def _lock_ui(self):
         self.review_btn.configure(
             state="disabled", text="검토 중..."
         )
+        self.sync_btn.configure(state="disabled")
 
     def _unlock_ui(self):
         self.review_btn.configure(
             state="normal", text="검토 시작"
         )
+        self.sync_btn.configure(state="normal")
 
     # ── 검토 ──
     def _start_review(self):
@@ -307,19 +409,60 @@ class App(ctk.CTk):
                         f"적합 (일치 {result['matched']}개)"
                     )
                 else:
-                    self._log(
-                        f"\n[{idx+1}] {fname}  →  "
-                        f"【불일치 {len(ng_items)}건 발견】"
-                    )
+                    sep = "─" * 53
+                    self._log(f"\n{sep}")
+                    self._log(f"[{idx+1}] {fname}  →  불일치 {len(ng_items)}건 발견")
+                    self._log(sep)
+
                     for d in ng_items:
-                        self._log(
-                            f"     [ NG ] {d['input']}"
-                        )
-                        if d["issue"]:
-                            for issue_line in d["issue"].split("\n"):
-                                self._log(
-                                    f"            → {issue_line}"
-                                )
+                        self._log(f" NG | {d['input']}")
+
+                        issue = d.get("issue", "")
+                        suggestion = d.get("suggestion", "")
+
+                        if "특정불가" in issue:
+                            lines = issue.split("\n")
+                            self._log(f"    | 사유: {lines[0]}")
+                            if len(lines) > 1:
+                                self._log("    | 후보:")
+                                for sub_line in lines[1:]:
+                                    sub_line = sub_line.strip()
+                                    if sub_line:
+                                        self._log(f"    |   {sub_line}")
+                        elif "→" in issue:
+                            reason = issue
+                            tail = ""
+                            if " → " in issue:
+                                reason, tail = issue.rsplit(" → ", 1)
+                            else:
+                                parts = [p.strip() for p in issue.split("→") if p.strip()]
+                                if len(parts) > 1:
+                                    reason = "→".join(parts[:-1]).strip()
+                                    tail = parts[-1]
+                                elif parts:
+                                    reason = parts[0]
+
+                            self._log(f"    | 사유: {reason}")
+
+                            if tail.startswith("공식:"):
+                                self._log(f"    | 공식: {tail[3:].strip()}")
+                            elif tail.startswith("후보:"):
+                                self._log(f"    | 후보: {tail[3:].strip()}")
+                            elif tail:
+                                self._log(f"    | 공식: {tail}")
+                            elif suggestion:
+                                self._log(f"    | 공식: {suggestion}")
+                        else:
+                            if issue:
+                                self._log(f"    | 사유: {issue}")
+                            elif suggestion:
+                                self._log("    | 사유: 불일치")
+                            if suggestion:
+                                self._log(f"    | 공식: {suggestion}")
+
+                        self._log("    |")
+
+                    self._log(sep)
 
                 self._set_progress((idx + 1) / total)
 
@@ -363,6 +506,16 @@ class App(ctk.CTk):
         self.after(0, lambda v=value: self.progress.set(v))
 
     # ── 리포트 ──
+    def _sync_db(self):
+        if self.is_reviewing:
+            return
+        messagebox.showinfo(
+            "DB 동기화",
+            "서버 URL이 설정되지 않았습니다.\n\n"
+            "서버 동기화 기능은 다음 버전에서 지원됩니다.\n"
+            f"현재 마스터DB: {len(self.master_names)}개 명칭"
+        )
+
     def _save_report(self):
         if self.is_reviewing:
             return

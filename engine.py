@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 # ═══════════════════════════════════════════════════════════
 #  파일 텍스트 추출 (지연 import)
 # ═══════════════════════════════════════════════════════════
-SUPPORTED_EXTENSIONS = {'.xlsx', '.pdf', '.docx', '.hwp'}
+SUPPORTED_EXTENSIONS = {'.xlsx', '.pdf', '.docx', '.hwp', '.csv'}
 
 
 def extract_from_xlsx(filepath: str) -> list:
@@ -103,6 +103,26 @@ def extract_from_hwp(filepath: str) -> list:
     return texts
 
 
+def extract_from_csv(filepath: str) -> list:
+    import csv
+
+    texts = []
+    for encoding in ['utf-8', 'cp949', 'euc-kr']:
+        try:
+            with open(filepath, 'r', encoding=encoding, newline='') as f:
+                reader = csv.reader(f)
+                for ri, row in enumerate(reader, 1):
+                    for ci, val in enumerate(row, 1):
+                        val = val.strip()
+                        if val:
+                            texts.append((f"R{ri} C{ci}", val))
+            return texts
+        except UnicodeDecodeError:
+            continue
+
+    raise ValueError(f"CSV 인코딩 인식 불가: {filepath}")
+
+
 def extract_text_from_file(filepath: str) -> list:
     ext = os.path.splitext(filepath)[1].lower()
     dispatch = {
@@ -110,6 +130,7 @@ def extract_text_from_file(filepath: str) -> list:
         '.pdf':  extract_from_pdf,
         '.docx': extract_from_docx,
         '.hwp':  extract_from_hwp,
+        '.csv':  extract_from_csv,
     }
     func = dispatch.get(ext)
     if func is None:
