@@ -3,6 +3,7 @@
 """
 
 import os
+import queue
 import threading
 from datetime import datetime
 
@@ -43,8 +44,10 @@ class App(ctk.CTk):
         self.file_paths = []
         self.all_results = []
         self.is_reviewing = False
+        self._drop_queue = queue.Queue()
 
         self._build_ui()
+        self._poll_drop_queue()
 
     def _build_ui(self):
 
@@ -129,7 +132,7 @@ class App(ctk.CTk):
         self.drop_hint_label = ctk.CTkLabel(
             lf,
             text="📂 파일을 여기에 드래그하거나\n[파일 추가] 버튼을 사용하세요",
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=26),
             text_color="#999999",
             justify="center"
         )
@@ -137,9 +140,16 @@ class App(ctk.CTk):
 
         if windnd is not None:
             try:
-                windnd.hook_dropfiles(self.file_listbox, func=self._on_drop_files)
-                windnd.hook_dropfiles(lf, func=self._on_drop_files)
-                windnd.hook_dropfiles(self.drop_hint_label, func=self._on_drop_files)
+                windnd.hook_dropfiles(
+                    self.file_listbox,
+                    func=self._on_drop_files,
+                    force_unicode=True
+                )
+                windnd.hook_dropfiles(
+                    lf,
+                    func=self._on_drop_files,
+                    force_unicode=True
+                )
             except Exception:
                 pass
 
@@ -307,8 +317,28 @@ class App(ctk.CTk):
         return str(item)
 
     def _on_drop_files(self, file_list):
-        """windnd 콜백 - 메인 스레드로 위임"""
-        self.after(0, lambda fl=file_list: self._process_dropped_files(fl))
+        """windnd 콜백 - 스레드 안전하게 큐에 적재"""
+        try:
+            self._drop_queue.put_nowait(list(file_list))
+        except Exception as e:
+            print(f"드래그 드롭 큐 적재 오류: {e}")
+
+    def _poll_drop_queue(self):
+        """메인 스레드에서 드롭 큐를 주기적으로 처리"""
+        try:
+            while True:
+                dropped = self._drop_queue.get_nowait()
+                self._process_dropped_files(dropped)
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print(f"드래그 드롭 큐 처리 오류: {e}")
+        finally:
+            try:
+                self.after(120, self._poll_drop_queue)
+            except tk.TclError:
+                # 종료 직후에는 after 재등록이 실패할 수 있음
+                pass
 
     def _process_dropped_files(self, file_list):
         """메인 스레드에서 드롭된 파일 처리"""
@@ -318,7 +348,7 @@ class App(ctk.CTk):
         try:
             for item in file_list:
                 fp = self._decode_drop_path(item)
-                if fp is None:
+                if not fp:
                     continue
 
                 fp = fp.strip().strip('"').strip("'")
