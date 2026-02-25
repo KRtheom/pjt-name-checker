@@ -1,5 +1,5 @@
 """
-공사현장 명칭 일원화 검토 프로그램 v3.5 (GUI)
+공사현장 명칭 일원화 검토 프로그램 v3.6 (GUI)
 """
 
 import os
@@ -18,11 +18,15 @@ except ImportError:
 
 from engine import (
     SUPPORTED_EXTENSIONS,
-    DEFAULT_MASTER_NAMES,
+    fetch_master_from_server,
+    get_last_master_load_error,
+    load_master_names,
     NameMatcher,
     ReviewEngine,
     save_excel_report,
 )
+
+MASTER_DB_URL = "https://www.krindus.co.kr/resources/upload/itdata/MasterDB.csv"
 
 
 class App(ctk.CTk):
@@ -30,24 +34,39 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("공사현장 명칭 일원화 검토 프로그램 v3.5")
+        self.title("공사현장 명칭 일원화 검토 프로그램 v3.6")
         self.geometry("1150x780")
         self.minsize(950, 650)
 
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
 
-        self.master_names = list(DEFAULT_MASTER_NAMES)
+        self.master_names, self.db_source = load_master_names(MASTER_DB_URL)
+        self._startup_db_error = get_last_master_load_error()
         self.matcher = NameMatcher(self.master_names)
         self.engine = ReviewEngine(self.matcher)
 
         self.file_paths = []
         self.all_results = []
         self.is_reviewing = False
+        self.is_syncing = False
         self._drop_queue = queue.Queue()
+        self._sync_queue = queue.Queue()
 
         self._build_ui()
         self._poll_drop_queue()
+        self._poll_sync_queue()
+
+        if self.db_source == "서버":
+            self._log(f"초기 DB 로드 완료: 서버 ({len(self.master_names)}개)")
+        else:
+            if self._startup_db_error:
+                self._log(
+                    "초기 DB 서버 로드 실패: "
+                    f"{self._startup_db_error} (내장DB 사용)"
+                )
+            else:
+                self._log(f"초기 DB 로드: 내장DB ({len(self.master_names)}개)")
 
     def _build_ui(self):
 
@@ -64,7 +83,7 @@ class App(ctk.CTk):
         ).pack(side="left", padx=15, pady=12)
 
         ctk.CTkLabel(
-            top, text="v3.5  |  HWP · PDF · XLSX · DOCX · CSV  ",
+            top, text="v3.6  |  HWP · PDF · XLSX · DOCX · CSV  ",
             font=ctk.CTkFont(size=12), text_color="#B0C4DE"
         ).pack(side="right", padx=15)
 
@@ -198,6 +217,14 @@ class App(ctk.CTk):
         )
         self.status_label.pack(side="left")
 
+        self.db_source_label = ctk.CTkLabel(
+            bottom,
+            text="DB: -",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#2F5496"
+        )
+        self.db_source_label.pack(side="left", padx=(12, 0))
+
         ctk.CTkButton(
             bottom, text="리포트 저장 (Excel)",
             width=170, height=38,
@@ -224,6 +251,7 @@ class App(ctk.CTk):
         self.sync_btn.pack(side="right", padx=(0, 8))
 
         self._refresh_count()
+        self._update_db_source_label()
 
     # ── 파일 관리 ──
     def _add_files(self):
@@ -296,6 +324,13 @@ class App(ctk.CTk):
             self._show_drop_hint()
         else:
             self._hide_drop_hint()
+
+    def _update_db_source_label(self):
+        if not hasattr(self, "db_source_label"):
+            return
+        self.db_source_label.configure(
+            text=f"DB: {self.db_source} ({len(self.master_names)}개)"
+        )
 
     def _show_drop_hint(self):
         if hasattr(self, "drop_hint_label"):
@@ -390,7 +425,7 @@ class App(ctk.CTk):
 
     # ── 검토 ──
     def _start_review(self):
-        if self.is_reviewing:
+        if self.is_reviewing or self.is_syncing:
             return
         if not self.file_paths:
             messagebox.showwarning(
@@ -556,14 +591,62 @@ class App(ctk.CTk):
 
     # ── 리포트 ──
     def _sync_db(self):
-        if self.is_reviewing:
+        if self.is_reviewing or self.is_syncing:
             return
-        messagebox.showinfo(
-            "DB 동기화",
-            "서버 URL이 설정되지 않았습니다.\n\n"
-            "서버 동기화 기능은 다음 버전에서 지원됩니다.\n"
-            f"현재 마스터DB: {len(self.master_names)}개 명칭"
+        self.is_syncing = True
+        self.sync_btn.configure(state="disabled", text="동기화 중...")
+        self._log("DB 동기화 시도 중...")
+        self._set_status("DB 동기화 시도 중...")
+
+        thread = threading.Thread(target=self._run_sync_db, daemon=True)
+        thread.start()
+
+    def _run_sync_db(self):
+        try:
+            names = fetch_master_from_server(MASTER_DB_URL)
+            self._sync_queue.put(("success", names))
+        except Exception as e:
+            self._sync_queue.put(("failure", str(e)))
+
+    def _poll_sync_queue(self):
+        try:
+            while True:
+                event_type, payload = self._sync_queue.get_nowait()
+                if event_type == "success":
+                    self._apply_synced_master(payload)
+                elif event_type == "failure":
+                    self._apply_sync_failure(payload)
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print(f"동기화 큐 처리 오류: {e}")
+        finally:
+            try:
+                self.after(120, self._poll_sync_queue)
+            except tk.TclError:
+                pass
+
+    def _apply_synced_master(self, names: list):
+        self.master_names = list(names)
+        self.matcher = NameMatcher(self.master_names)
+        self.engine = ReviewEngine(self.matcher)
+        self.db_source = "서버"
+        self._update_db_source_label()
+
+        self._log(f"동기화 완료 ({len(self.master_names)}개 명칭 로드)")
+        self._set_status(f"DB 동기화 완료 ({len(self.master_names)}개)")
+        self.is_syncing = False
+        self.sync_btn.configure(state="normal", text="DB 동기화")
+
+    def _apply_sync_failure(self, error_message: str):
+        self._log(
+            f"동기화 실패: {error_message}, "
+            f"기존 DB 유지 ({len(self.master_names)}개)"
         )
+        self._set_status("DB 동기화 실패 (기존 DB 유지)")
+        self._update_db_source_label()
+        self.is_syncing = False
+        self.sync_btn.configure(state="normal", text="DB 동기화")
 
     def _save_report(self):
         if self.is_reviewing:

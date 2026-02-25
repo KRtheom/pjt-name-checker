@@ -7,6 +7,8 @@ import re
 from datetime import datetime
 from difflib import SequenceMatcher
 
+_LAST_MASTER_LOAD_ERROR = ""
+
 
 # ═══════════════════════════════════════════════════════════
 #  파일 텍스트 추출 (지연 import)
@@ -136,6 +138,24 @@ def extract_text_from_file(filepath: str) -> list:
     if func is None:
         raise ValueError(f"지원하지 않는 형식: {ext}")
     return func(filepath)
+
+
+def fetch_master_from_server(url: str, timeout: int = 10) -> list:
+    import requests
+
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+
+    raw_text = response.text.lstrip("\ufeff")
+    names = [
+        line.strip().lstrip("\ufeff")
+        for line in raw_text.splitlines()
+        if line.strip()
+    ]
+    if len(names) < 10:
+        raise ValueError("서버 데이터가 너무 적습니다")
+
+    return names
 
 
 # ═══════════════════════════════════════════════════════════
@@ -316,6 +336,25 @@ DEFAULT_MASTER_NAMES = [
     "(도전)25년 진주지사TN",
     "(민운)25년 서울춘천TN",
 ]
+
+
+def load_master_names(url: str = None) -> tuple[list, str]:
+    global _LAST_MASTER_LOAD_ERROR
+
+    _LAST_MASTER_LOAD_ERROR = ""
+    if not url:
+        return list(DEFAULT_MASTER_NAMES), "내장DB"
+
+    try:
+        names = fetch_master_from_server(url)
+        return names, "서버"
+    except Exception as e:
+        _LAST_MASTER_LOAD_ERROR = str(e)
+        return list(DEFAULT_MASTER_NAMES), "내장DB"
+
+
+def get_last_master_load_error() -> str:
+    return _LAST_MASTER_LOAD_ERROR
 
 
 # ═══════════════════════════════════════════════════════════
