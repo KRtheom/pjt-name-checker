@@ -1,15 +1,20 @@
 """
-공사현장 명칭 일원화 검토 프로그램 v3.6 (GUI)
+공사현장 명칭 일원화 검토 프로그램 v3.6.1 (GUI)
 """
 
 import os
 import queue
+import sys
 import threading
 from datetime import datetime
 
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 try:
     import windnd
@@ -18,7 +23,6 @@ except ImportError:
 
 from engine import (
     SUPPORTED_EXTENSIONS,
-    fetch_master_from_server,
     get_last_master_load_error,
     load_master_names,
     NameMatcher,
@@ -27,6 +31,15 @@ from engine import (
 )
 
 MASTER_DB_URL = "https://www.krindus.co.kr/resources/upload/itdata/MasterDB.csv"
+APP_VERSION = "v3.6.1"
+
+
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except AttributeError:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 
 class App(ctk.CTk):
@@ -34,7 +47,7 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("공사현장 명칭 일원화 검토 프로그램 v3.6")
+        self.title(f"공사현장 명칭 일원화 검토 프로그램 {APP_VERSION}")
         self.geometry("1150x780")
         self.minsize(950, 650)
 
@@ -83,7 +96,7 @@ class App(ctk.CTk):
         ).pack(side="left", padx=15, pady=12)
 
         ctk.CTkLabel(
-            top, text="v3.6  |  HWP · PDF · XLSX · DOCX · CSV  ",
+            top, text=f"{APP_VERSION}  |  HWP · PDF · XLSX · DOCX · CSV  ",
             font=ctk.CTkFont(size=12), text_color="#B0C4DE"
         ).pack(side="right", padx=15)
 
@@ -148,14 +161,7 @@ class App(ctk.CTk):
         self.file_listbox.pack(fill="both", expand=True)
         sb.config(command=self.file_listbox.yview)
 
-        self.drop_hint_label = ctk.CTkLabel(
-            lf,
-            text="📂 파일을 여기에 드래그하거나\n[파일 추가] 버튼을 사용하세요",
-            font=ctk.CTkFont(size=26),
-            text_color="#999999",
-            justify="center"
-        )
-        self.drop_hint_label.place(relx=0.5, rely=0.5, anchor="center")
+        self._build_drop_hint(lf)
 
         if windnd is not None:
             try:
@@ -180,7 +186,7 @@ class App(ctk.CTk):
         self.support_label = ctk.CTkLabel(
             left,
             text="지원 형식: HWP · PDF · XLSX · DOCX · CSV",
-            font=ctk.CTkFont(size=10),
+            font=ctk.CTkFont(size=15),
             text_color="gray"
         )
         self.support_label.pack(padx=10, pady=(0, 5), anchor="w")
@@ -332,12 +338,54 @@ class App(ctk.CTk):
             text=f"DB: {self.db_source} ({len(self.master_names)}개)"
         )
 
+    def _build_drop_hint(self, parent):
+        self.drop_hint_label = None
+        self.drop_hint_image = None
+        self.drop_hint_image_label = None
+
+        image_path = resource_path("drag_guide.png")
+        if Image is not None and os.path.exists(image_path):
+            try:
+                with Image.open(image_path) as src:
+                    pil_image = src.copy()
+
+                width, height = pil_image.size
+                target_width = 280
+                target_height = max(1, int((height / width) * target_width))
+
+                self.drop_hint_image = ctk.CTkImage(
+                    light_image=pil_image,
+                    dark_image=pil_image,
+                    size=(target_width, target_height)
+                )
+                self.drop_hint_image_label = ctk.CTkLabel(
+                    parent,
+                    text="",
+                    image=self.drop_hint_image
+                )
+                return
+            except Exception:
+                pass
+
+        self.drop_hint_label = ctk.CTkLabel(
+            parent,
+            text="📂 파일을 여기에 드래그하거나\n[파일 추가] 버튼을 사용하세요",
+            font=ctk.CTkFont(size=20),
+            text_color="#999999",
+            justify="center"
+        )
+
     def _show_drop_hint(self):
-        if hasattr(self, "drop_hint_label"):
+        if getattr(self, "drop_hint_image_label", None) is not None:
+            self.drop_hint_image_label.place(relx=0.5, rely=0.5, anchor="center")
+            return
+        if getattr(self, "drop_hint_label", None) is not None:
             self.drop_hint_label.place(relx=0.5, rely=0.5, anchor="center")
 
     def _hide_drop_hint(self):
-        if hasattr(self, "drop_hint_label"):
+        if getattr(self, "drop_hint_image_label", None) is not None:
+            self.drop_hint_image_label.place_forget()
+        if getattr(self, "drop_hint_label", None) is not None:
             self.drop_hint_label.place_forget()
 
     @staticmethod
@@ -603,7 +651,10 @@ class App(ctk.CTk):
 
     def _run_sync_db(self):
         try:
-            names = fetch_master_from_server(MASTER_DB_URL)
+            names, source = load_master_names(MASTER_DB_URL)
+            if source != "서버":
+                error = get_last_master_load_error() or "서버 DB 동기화 실패"
+                raise RuntimeError(error)
             self._sync_queue.put(("success", names))
         except Exception as e:
             self._sync_queue.put(("failure", str(e)))
@@ -627,7 +678,7 @@ class App(ctk.CTk):
                 pass
 
     def _apply_synced_master(self, names: list):
-        self.master_names = list(names)
+        self.master_names = list(dict.fromkeys(names))
         self.matcher = NameMatcher(self.master_names)
         self.engine = ReviewEngine(self.matcher)
         self.db_source = "서버"

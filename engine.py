@@ -141,17 +141,17 @@ def extract_text_from_file(filepath: str) -> list:
 
 
 def fetch_master_from_server(url: str, timeout: int = 10) -> list:
+    import csv
+    import io
     import requests
 
     response = requests.get(url, timeout=timeout)
     response.raise_for_status()
 
-    raw_text = response.text.lstrip("\ufeff")
-    names = [
-        line.strip().lstrip("\ufeff")
-        for line in raw_text.splitlines()
-        if line.strip()
-    ]
+    raw_text = _decode_master_csv_text(response.content)
+    reader = csv.reader(io.StringIO(raw_text))
+    raw_names = [row[0] for row in reader if row]
+    names = _sanitize_master_names(raw_names)
     if len(names) < 10:
         raise ValueError("서버 데이터가 너무 적습니다")
 
@@ -161,6 +161,29 @@ def fetch_master_from_server(url: str, timeout: int = 10) -> list:
 # ═══════════════════════════════════════════════════════════
 #  기본 마스터 명칭
 # ═══════════════════════════════════════════════════════════
+def _sanitize_master_names(raw_names: list) -> list:
+    sanitized = []
+    seen = set()
+    for raw in raw_names:
+        if raw is None:
+            continue
+        name = str(raw).strip().lstrip("\ufeff")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        sanitized.append(name)
+    return sanitized
+
+
+def _decode_master_csv_text(raw: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 DEFAULT_MASTER_NAMES = [
     "(민간)부산미음동물류",
     "(CM)평택고덕10A",
@@ -342,15 +365,17 @@ def load_master_names(url: str = None) -> tuple[list, str]:
     global _LAST_MASTER_LOAD_ERROR
 
     _LAST_MASTER_LOAD_ERROR = ""
+    fallback_names = _sanitize_master_names(DEFAULT_MASTER_NAMES)
+
     if not url:
-        return list(DEFAULT_MASTER_NAMES), "내장DB"
+        return fallback_names, "내장DB"
 
     try:
         names = fetch_master_from_server(url)
         return names, "서버"
     except Exception as e:
         _LAST_MASTER_LOAD_ERROR = str(e)
-        return list(DEFAULT_MASTER_NAMES), "내장DB"
+        return fallback_names, "내장DB"
 
 
 def get_last_master_load_error() -> str:
