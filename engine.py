@@ -1,5 +1,5 @@
 """
-engine.py - 공사명칭 검토 엔진 v3.0
+engine.py - 공사명칭 검토 엔진
 """
 
 import os
@@ -14,7 +14,7 @@ _LAST_MASTER_LOAD_ERROR = ""
 # ═══════════════════════════════════════════════════════════
 #  파일 텍스트 추출 (지연 import)
 # ═══════════════════════════════════════════════════════════
-SUPPORTED_EXTENSIONS = {'.xlsx', '.pdf', '.docx', '.hwp', '.csv'}
+SUPPORTED_EXTENSIONS = {'.xlsx', '.pdf', '.docx', '.hwp', '.hwpx', '.csv'}
 
 
 def extract_from_xlsx(filepath: str) -> list:
@@ -85,35 +85,146 @@ def extract_from_docx(filepath: str) -> list:
     return texts
 
 
-def extract_from_hwp(filepath: str) -> list:
+def _extract_from_hwp_ole(filepath: str) -> list:
+    import olefile
+    import struct
+    import zlib
+
+    if not olefile.isOleFile(filepath):
+        raise ValueError("OLE 기반 HWP 파일이 아닙니다.")
+
     texts = []
-    hwp = None
-    try:
-        import pyhwpx
-        hwp = pyhwpx.Hwp(visible=False)
-        hwp.open(filepath)
-        raw = hwp.get_text()
-        if isinstance(raw, str):
-            lines = raw.split('\n')
-        elif isinstance(raw, list):
-            lines = [str(x) for x in raw]
-        else:
-            lines = [str(raw)]
-        for i, line in enumerate(lines, 1):
-            line = line.strip()
-            if line:
-                texts.append((f"HWP L{i}", line))
-    except ImportError:
-        raise ImportError("HWP: pyhwpx와 한컴오피스가 필요합니다.")
-    except Exception as e:
-        raise Exception(f"HWP 읽기 실패: {e}")
-    finally:
-        if hwp:
+    line_num = 0
+
+    with olefile.OleFileIO(filepath) as f:
+        if not f.exists("FileHeader"):
+            raise ValueError("HWP FileHeader 스트림이 없습니다.")
+        header_data = f.openstream("FileHeader").read()
+        if len(header_data) <= 36:
+            raise ValueError("HWP FileHeader가 손상되었습니다.")
+        is_compressed = (header_data[36] & 1) == 1
+
+        section_nums = []
+        for item in f.listdir():
+            if len(item) < 2:
+                continue
+            if item[0] != "BodyText":
+                continue
+            if not item[1].startswith("Section"):
+                continue
             try:
-                hwp.quit()
-            except Exception:
-                pass
+                section_nums.append(int(item[1].replace("Section", "")))
+            except ValueError:
+                continue
+        section_nums.sort()
+
+        for snum in section_nums:
+            stream_name = f"BodyText/Section{snum}"
+            if not f.exists(stream_name):
+                continue
+            data = f.openstream(stream_name).read()
+            if is_compressed:
+                try:
+                    data = zlib.decompress(data, -15)
+                except Exception:
+                    continue
+
+            i = 0
+            data_len = len(data)
+            while i + 4 <= data_len:
+                header_val = struct.unpack_from("<I", data, i)[0]
+                rec_type = header_val & 0x3FF
+                rec_len = (header_val >> 20) & 0xFFF
+                i += 4
+
+                if rec_len < 0 or i + rec_len > data_len:
+                    break
+
+                if rec_type == 67 and rec_len > 0:
+                    payload = data[i:i + rec_len]
+                    text = payload.decode("utf-16-le", errors="ignore")
+
+                    clean_chars = []
+                    for ch in text:
+                        if ch in ("\r", "\n"):
+                            clean_chars.append("\n")
+                        elif ord(ch) >= 32:
+                            clean_chars.append(ch)
+                    clean = "".join(clean_chars)
+
+                    for line in clean.split("\n"):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        line_num += 1
+                        texts.append((f"HWP L{line_num}", line))
+
+                i += rec_len
+
     return texts
+
+
+def extract_from_hwp(filepath: str) -> list:
+    try:
+        texts = _extract_from_hwp_ole(filepath)
+    except Exception as e:
+        raise RuntimeError(f"HWP 읽기 실패: {e}")
+
+    if not texts:
+        raise RuntimeError("HWP 읽기 실패: olefile 추출 결과 0건")
+    return texts
+
+
+def extract_from_hwpx(filepath: str) -> list:
+    """신형 .hwpx 파일 - ZIP+XML 파싱 (한컴오피스 불필요)"""
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    texts = []
+    line_num = 0
+
+    def _section_order(path: str):
+        m = re.search(r"section(\d+)\.xml$", path, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+        return 10**9
+
+    try:
+        with zipfile.ZipFile(filepath, "r") as zf:
+            section_files = sorted(
+                [
+                    name for name in zf.namelist()
+                    if name.startswith("Contents/section")
+                    and name.endswith(".xml")
+                ],
+                key=_section_order
+            )
+            if not section_files:
+                raise ValueError("Contents/section*.xml을 찾지 못했습니다.")
+
+            for section_file in section_files:
+                with zf.open(section_file) as sf:
+                    tree = ET.parse(sf)
+                    root = tree.getroot()
+
+                    for elem in root.iter():
+                        tag = elem.tag
+                        if isinstance(tag, str) and "}" in tag:
+                            tag = tag.split("}", 1)[1]
+                        if tag != "t" or not elem.text:
+                            continue
+
+                        text = elem.text.strip()
+                        if not text:
+                            continue
+                        line_num += 1
+                        texts.append((f"HWPX L{line_num}", text))
+
+        if not texts:
+            raise ValueError("본문 텍스트를 찾지 못했습니다.")
+        return texts
+    except Exception as e:
+        raise RuntimeError(f"HWPX 파일 읽기 실패: {e}")
 
 
 def extract_from_csv(filepath: str) -> list:
@@ -145,6 +256,7 @@ def extract_text_from_file(filepath: str, include_pdf_tables: bool = False) -> l
         ".xlsx": extract_from_xlsx,
         ".docx": extract_from_docx,
         ".hwp": extract_from_hwp,
+        ".hwpx": extract_from_hwpx,
         ".csv": extract_from_csv,
     }
     func = dispatch.get(ext)
@@ -396,7 +508,7 @@ def get_last_master_load_error() -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-#  명칭 매칭 엔진 v3.0
+#  명칭 매칭 엔진
 # ═══════════════════════════════════════════════════════════
 class NameMatcher:
 

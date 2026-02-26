@@ -1,5 +1,5 @@
 """
-공사현장 명칭 일원화 검토 프로그램 v3.7.1 (GUI)
+공사명칭 검증기 v1.0 (GUI)
 """
 
 import os
@@ -32,7 +32,7 @@ from engine import (
 )
 
 MASTER_DB_URL = "https://www.krindus.co.kr/resources/upload/itdata/MasterDB.csv"
-APP_VERSION = "v3.7.1"
+APP_VERSION = "v1.0"
 
 
 def resource_path(relative_path):
@@ -48,7 +48,7 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title(f"공사현장 명칭 일원화 검토 프로그램 {APP_VERSION}")
+        self.title(f"공사명칭 검증기 {APP_VERSION}")
         self.geometry("1150x780")
         self.minsize(950, 650)
 
@@ -56,11 +56,6 @@ class App(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.master_names, self.db_source = load_master_names(MASTER_DB_URL)
-        self.db_updated_on = (
-            datetime.now().strftime("%Y-%m-%d")
-            if self.db_source == "서버"
-            else ""
-        )
         self._startup_db_error = get_last_master_load_error()
         self.matcher = NameMatcher(self.master_names)
         self.engine = ReviewEngine(self.matcher)
@@ -96,15 +91,19 @@ class App(ctk.CTk):
         top.pack_propagate(False)
 
         ctk.CTkLabel(
-            top, text="  공사현장 명칭 일원화 검토",
+            top, text="공사명칭 검증기",
             font=ctk.CTkFont(size=20, weight="bold"),
             text_color="white"
         ).pack(side="left", padx=15, pady=12)
 
-        ctk.CTkLabel(
-            top, text=f"{APP_VERSION}",
-            font=ctk.CTkFont(size=12), text_color="#B0C4DE"
-        ).pack(side="right", padx=15)
+        self.contact_label = ctk.CTkLabel(
+            top,
+            text="DB갱신 및 문의처 : 경영관리팀 02-6984-9090",
+            font=ctk.CTkFont(size=11),
+            text_color="#aaaaaa",
+            cursor=""
+        )
+        self.contact_label.pack(side="right", padx=15, pady=16)
 
         # 메인
         main = ctk.CTkFrame(self, fg_color="transparent")
@@ -160,7 +159,7 @@ class App(ctk.CTk):
         sb.pack(side="right", fill="y")
 
         self.file_listbox = tk.Listbox(
-            lf, font=("맑은 고딕", 10),
+            lf, font=("맑은 고딕", 14),
             selectmode=tk.EXTENDED, activestyle="none",
             yscrollcommand=sb.set
         )
@@ -191,7 +190,7 @@ class App(ctk.CTk):
 
         self.support_label = ctk.CTkLabel(
             left,
-            text="지원 형식: HWP · PDF · XLSX · DOCX · CSV",
+            text="지원 형식: HWP · HWPX · PDF · XLSX · DOCX · CSV",
             font=ctk.CTkFont(size=15),
             text_color="gray"
         )
@@ -234,7 +233,7 @@ class App(ctk.CTk):
         self.db_source_label = ctk.CTkLabel(
             bottom,
             text="DB: -",
-            font=ctk.CTkFont(size=11, weight="bold"),
+            font=ctk.CTkFont(size=14, weight="bold"),
             text_color="#2F5496"
         )
         self.db_source_label.pack(side="left", padx=(12, 0))
@@ -242,7 +241,7 @@ class App(ctk.CTk):
         self.status_label = ctk.CTkLabel(
             bottom,
             text="파일을 추가한 후 [검토 시작]을 눌러주세요.",
-            font=ctk.CTkFont(size=11)
+            font=ctk.CTkFont(size=14)
         )
         self.status_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
 
@@ -267,12 +266,20 @@ class App(ctk.CTk):
         self._update_db_source_label()
 
     # ── 파일 관리 ──
+    @staticmethod
+    def _format_list_display_name(path_or_name: str) -> str:
+        filename = os.path.basename(path_or_name)
+        stem, ext = os.path.splitext(filename)
+        if len(stem) <= 20:
+            return filename
+        return f"{stem[:10]}...{stem[-5:]}{ext}"
+
     def _add_files(self):
         if self.is_reviewing:
             return
         types = [
-            ("지원 형식", "*.hwp *.pdf *.xlsx *.docx *.csv"),
-            ("HWP", "*.hwp"), ("PDF", "*.pdf"),
+            ("지원 형식", "*.hwp *.hwpx *.pdf *.xlsx *.docx *.csv"),
+            ("HWP", "*.hwp"), ("HWPX", "*.hwpx"), ("PDF", "*.pdf"),
             ("Excel", "*.xlsx"), ("Word", "*.docx"), ("CSV", "*.csv"),
         ]
         paths = filedialog.askopenfilenames(
@@ -282,7 +289,7 @@ class App(ctk.CTk):
             if p not in self.file_paths:
                 self.file_paths.append(p)
                 self.file_listbox.insert(
-                    tk.END, os.path.basename(p)
+                    tk.END, self._format_list_display_name(p)
                 )
         self._refresh_count()
 
@@ -300,7 +307,9 @@ class App(ctk.CTk):
                     fp = os.path.join(root, f)
                     if fp not in self.file_paths:
                         self.file_paths.append(fp)
-                        self.file_listbox.insert(tk.END, f)
+                        self.file_listbox.insert(
+                            tk.END, self._format_list_display_name(fp)
+                        )
                         added += 1
         self._refresh_count()
         if added == 0:
@@ -343,8 +352,7 @@ class App(ctk.CTk):
             return
         count = len(self.master_names)
         if self.db_source == "서버":
-            updated = self.db_updated_on or datetime.now().strftime("%Y-%m-%d")
-            text = f"DB: 서버 ({count}개 · {updated} 갱신)"
+            text = f"DB: 서버 ({count}개)"
         else:
             text = f"DB: 내장 ({count}개)"
         self.db_source_label.configure(text=text)
@@ -463,7 +471,9 @@ class App(ctk.CTk):
                     continue
 
                 self.file_paths.append(fp)
-                self.file_listbox.insert(tk.END, os.path.basename(fp))
+                self.file_listbox.insert(
+                    tk.END, self._format_list_display_name(fp)
+                )
 
             self._refresh_count()
         except Exception as e:
@@ -699,7 +709,6 @@ class App(ctk.CTk):
         self.matcher = NameMatcher(self.master_names)
         self.engine = ReviewEngine(self.matcher)
         self.db_source = "서버"
-        self.db_updated_on = datetime.now().strftime("%Y-%m-%d")
         self._update_db_source_label()
 
         self._log(f"동기화 완료 ({len(self.master_names)}개 명칭 로드)")
