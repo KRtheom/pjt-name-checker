@@ -14,7 +14,7 @@ _LAST_MASTER_LOAD_ERROR = ""
 # ═══════════════════════════════════════════════════════════
 #  파일 텍스트 추출 (지연 import)
 # ═══════════════════════════════════════════════════════════
-SUPPORTED_EXTENSIONS = {'.xlsx', '.pdf', '.docx', '.hwp', '.csv'}
+SUPPORTED_EXTENSIONS = {'.xlsx', '.pdf', '.docx', '.hwp', '.hwpx', '.csv'}
 
 
 def extract_from_xlsx(filepath: str) -> list:
@@ -116,6 +116,48 @@ def extract_from_hwp(filepath: str) -> list:
     return texts
 
 
+def extract_from_hwpx(filepath: str) -> list:
+    """신형 .hwpx 파일 - ZIP + XML 파싱"""
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    texts = []
+    line_num = 0
+
+    try:
+        with zipfile.ZipFile(filepath, 'r') as zf:
+            section_files = sorted([
+                name for name in zf.namelist()
+                if name.startswith('Contents/section') and name.endswith('.xml')
+            ])
+
+            if not section_files:
+                raise ValueError("Contents/section*.xml을 찾지 못했습니다.")
+
+            for section_file in section_files:
+                with zf.open(section_file) as sf:
+                    root = ET.parse(sf).getroot()
+
+                    for elem in root.iter():
+                        tag = elem.tag
+                        if isinstance(tag, str) and '}' in tag:
+                            tag = tag.split('}', 1)[1]
+                        if tag != 't' or not elem.text:
+                            continue
+
+                        text = elem.text.strip()
+                        if not text:
+                            continue
+                        line_num += 1
+                        texts.append((f"HWPX L{line_num}", text))
+
+        if not texts:
+            raise ValueError("본문 텍스트를 찾지 못했습니다.")
+        return texts
+    except Exception as e:
+        raise RuntimeError(f"HWPX 파일 읽기 실패: {e}")
+
+
 def extract_from_csv(filepath: str) -> list:
     import csv
 
@@ -145,6 +187,7 @@ def extract_text_from_file(filepath: str, include_pdf_tables: bool = False) -> l
         ".xlsx": extract_from_xlsx,
         ".docx": extract_from_docx,
         ".hwp": extract_from_hwp,
+        ".hwpx": extract_from_hwpx,
         ".csv": extract_from_csv,
     }
     func = dispatch.get(ext)

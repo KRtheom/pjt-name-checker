@@ -190,7 +190,7 @@ class App(ctk.CTk):
 
         self.support_label = ctk.CTkLabel(
             left,
-            text="지원 형식: HWP · PDF · XLSX · DOCX · CSV",
+            text="지원 형식: HWP · HWPX · PDF · XLSX · DOCX · CSV",
             font=ctk.CTkFont(size=15),
             text_color="gray"
         )
@@ -261,8 +261,8 @@ class App(ctk.CTk):
         if self.is_reviewing:
             return
         types = [
-            ("지원 형식", "*.hwp *.pdf *.xlsx *.docx *.csv"),
-            ("HWP", "*.hwp"), ("PDF", "*.pdf"),
+            ("지원 형식", "*.hwp *.hwpx *.pdf *.xlsx *.docx *.csv"),
+            ("HWP", "*.hwp"), ("HWPX", "*.hwpx"), ("PDF", "*.pdf"),
             ("Excel", "*.xlsx"), ("Word", "*.docx"), ("CSV", "*.csv"),
         ]
         paths = filedialog.askopenfilenames(
