@@ -1,5 +1,5 @@
 """
-공사현장 명칭 일원화 검토 프로그램 v3.7.1 (GUI)
+공사명칭 검토기 v1.0 (GUI)
 """
 
 import os
@@ -32,7 +32,7 @@ from engine import (
 )
 
 MASTER_DB_URL = "https://www.krindus.co.kr/resources/upload/itdata/MasterDB.csv"
-APP_VERSION = "v3.7.1"
+APP_VERSION = "v1.0"
 
 
 def resource_path(relative_path):
@@ -48,7 +48,7 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title(f"공사현장 명칭 일원화 검토 프로그램 {APP_VERSION}")
+        self.title(f"공사명칭 검토기 {APP_VERSION}")
         self.geometry("1150x780")
         self.minsize(950, 650)
 
@@ -56,11 +56,7 @@ class App(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.master_names, self.db_source = load_master_names(MASTER_DB_URL)
-        self.db_updated_on = (
-            datetime.now().strftime("%Y-%m-%d")
-            if self.db_source == "서버"
-            else ""
-        )
+        self.is_server_synced = self.db_source == "서버"
         self._startup_db_error = get_last_master_load_error()
         self.matcher = NameMatcher(self.master_names)
         self.engine = ReviewEngine(self.matcher)
@@ -96,15 +92,18 @@ class App(ctk.CTk):
         top.pack_propagate(False)
 
         ctk.CTkLabel(
-            top, text="  공사현장 명칭 일원화 검토",
+            top, text="  공사명칭 검토기",
             font=ctk.CTkFont(size=20, weight="bold"),
             text_color="white"
         ).pack(side="left", padx=15, pady=12)
 
-        ctk.CTkLabel(
-            top, text=f"{APP_VERSION}",
-            font=ctk.CTkFont(size=12), text_color="#B0C4DE"
-        ).pack(side="right", padx=15)
+        self.contact_label = ctk.CTkLabel(
+            top,
+            text="DB갱신 및 문의처 : 전산파트 02-6984-9090",
+            font=ctk.CTkFont(size=11),
+            text_color="#aaaaaa"
+        )
+        self.contact_label.pack(side="right", padx=15)
 
         # 메인
         main = ctk.CTkFrame(self, fg_color="transparent")
@@ -222,22 +221,13 @@ class App(ctk.CTk):
         self.progress.pack(fill="x", pady=(0, 8))
         self.progress.set(0)
 
-        self.sync_btn = ctk.CTkButton(
-            bottom, text="DB 동기화",
-            width=130, height=38,
-            fg_color="#FF8C00", hover_color="#E07B00", text_color="white",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            command=self._sync_db
-        )
-        self.sync_btn.pack(side="left")
-
         self.db_source_label = ctk.CTkLabel(
             bottom,
-            text="DB: -",
+            text="DB상태 : -",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color="#2F5496"
         )
-        self.db_source_label.pack(side="left", padx=(12, 0))
+        self.db_source_label.pack(side="left", padx=(0, 0))
 
         self.status_label = ctk.CTkLabel(
             bottom,
@@ -342,11 +332,10 @@ class App(ctk.CTk):
         if not hasattr(self, "db_source_label"):
             return
         count = len(self.master_names)
-        if self.db_source == "서버":
-            updated = self.db_updated_on or datetime.now().strftime("%Y-%m-%d")
-            text = f"DB: 서버 ({count}개 · {updated} 갱신)"
+        if self.is_server_synced:
+            text = f"DB상태 : {count}개(서버동기)"
         else:
-            text = f"DB: 내장 ({count}개)"
+            text = f"DB상태 : {count}개(서버미동기)"
         self.db_source_label.configure(text=text)
 
     def _build_drop_hint(self, parent):
@@ -474,13 +463,11 @@ class App(ctk.CTk):
         self.review_btn.configure(
             state="disabled", text="검토 중..."
         )
-        self.sync_btn.configure(state="disabled")
 
     def _unlock_ui(self):
         self.review_btn.configure(
             state="normal", text="검토 시작"
         )
-        self.sync_btn.configure(state="normal")
 
     # ── 검토 ──
     def _start_review(self):
@@ -659,7 +646,6 @@ class App(ctk.CTk):
         if self.is_reviewing or self.is_syncing:
             return
         self.is_syncing = True
-        self.sync_btn.configure(state="disabled", text="동기화 중...")
         self._log("DB 동기화 시도 중...")
         self._set_status("DB 동기화 시도 중...")
 
@@ -699,13 +685,12 @@ class App(ctk.CTk):
         self.matcher = NameMatcher(self.master_names)
         self.engine = ReviewEngine(self.matcher)
         self.db_source = "서버"
-        self.db_updated_on = datetime.now().strftime("%Y-%m-%d")
+        self.is_server_synced = True
         self._update_db_source_label()
 
         self._log(f"동기화 완료 ({len(self.master_names)}개 명칭 로드)")
         self._set_status(f"DB 동기화 완료 ({len(self.master_names)}개)")
         self.is_syncing = False
-        self.sync_btn.configure(state="normal", text="DB 동기화")
 
     def _apply_sync_failure(self, error_message: str):
         self._log(
@@ -713,9 +698,9 @@ class App(ctk.CTk):
             f"기존 DB 유지 ({len(self.master_names)}개)"
         )
         self._set_status("DB 동기화 실패 (기존 DB 유지)")
+        self.is_server_synced = False
         self._update_db_source_label()
         self.is_syncing = False
-        self.sync_btn.configure(state="normal", text="DB 동기화")
 
     def _save_report(self):
         if self.is_reviewing:
