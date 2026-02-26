@@ -33,29 +33,38 @@ def extract_from_xlsx(filepath: str) -> list:
     return texts
 
 
-def extract_from_pdf(filepath: str, include_tables: bool = False) -> list:
-    import pdfplumber
+def extract_from_pdf(filepath: str) -> list:
     texts = []
-    with pdfplumber.open(filepath) as pdf:
-        for pn, page in enumerate(pdf.pages, 1):
-            pt = page.extract_text()
-            if pt:
-                for ln, line in enumerate(pt.split('\n'), 1):
+
+    try:
+        import fitz  # PyMuPDF
+
+        doc = fitz.open(filepath)
+        try:
+            for page_num, page in enumerate(doc, 1):
+                page_text = page.get_text()
+                if not page_text:
+                    continue
+                for line_num, line in enumerate(page_text.split('\n'), 1):
                     line = line.strip()
                     if line:
-                        texts.append((f"P{pn} L{ln}", line))
-            if include_tables:
-                tables = page.extract_tables()
-                if tables:
-                    for ti, table in enumerate(tables, 1):
-                        for ri, row in enumerate(table, 1):
-                            if row:
-                                for ci, cv in enumerate(row, 1):
-                                    if cv and str(cv).strip():
-                                        texts.append(
-                                            (f"P{pn} 표{ti}({ri},{ci})",
-                                             str(cv).strip())
-                                        )
+                        texts.append((f"P{page_num} L{line_num}", line))
+        finally:
+            doc.close()
+        return texts
+    except ImportError:
+        pass
+
+    import pdfplumber
+    with pdfplumber.open(filepath) as pdf:
+        for page_num, page in enumerate(pdf.pages, 1):
+            page_text = page.extract_text()
+            if not page_text:
+                continue
+            for line_num, line in enumerate(page_text.split('\n'), 1):
+                line = line.strip()
+                if line:
+                    texts.append((f"P{page_num} L{line_num}", line))
     return texts
 
 
@@ -130,7 +139,7 @@ def extract_from_csv(filepath: str) -> list:
 def extract_text_from_file(filepath: str, include_pdf_tables: bool = False) -> list:
     ext = os.path.splitext(filepath)[1].lower()
     if ext == ".pdf":
-        return extract_from_pdf(filepath, include_tables=include_pdf_tables)
+        return extract_from_pdf(filepath)
 
     dispatch = {
         ".xlsx": extract_from_xlsx,

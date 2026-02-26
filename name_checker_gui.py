@@ -1,5 +1,5 @@
 """
-공사현장 명칭 일원화 검토 프로그램 v3.7 (GUI)
+공사현장 명칭 일원화 검토 프로그램 v3.7.1 (GUI)
 """
 
 import os
@@ -32,7 +32,7 @@ from engine import (
 )
 
 MASTER_DB_URL = "https://www.krindus.co.kr/resources/upload/itdata/MasterDB.csv"
-APP_VERSION = "v3.7"
+APP_VERSION = "v3.7.1"
 
 
 def resource_path(relative_path):
@@ -56,6 +56,11 @@ class App(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.master_names, self.db_source = load_master_names(MASTER_DB_URL)
+        self.db_updated_on = (
+            datetime.now().strftime("%Y-%m-%d")
+            if self.db_source == "서버"
+            else ""
+        )
         self._startup_db_error = get_last_master_load_error()
         self.matcher = NameMatcher(self.master_names)
         self.engine = ReviewEngine(self.matcher)
@@ -97,7 +102,7 @@ class App(ctk.CTk):
         ).pack(side="left", padx=15, pady=12)
 
         ctk.CTkLabel(
-            top, text=f"{APP_VERSION}  |  HWP · PDF · XLSX · DOCX · CSV  ",
+            top, text=f"{APP_VERSION}",
             font=ctk.CTkFont(size=12), text_color="#B0C4DE"
         ).pack(side="right", padx=15)
 
@@ -217,12 +222,14 @@ class App(ctk.CTk):
         self.progress.pack(fill="x", pady=(0, 8))
         self.progress.set(0)
 
-        self.status_label = ctk.CTkLabel(
-            bottom,
-            text="파일을 추가한 후 [검토 시작]을 눌러주세요.",
-            font=ctk.CTkFont(size=11)
+        self.sync_btn = ctk.CTkButton(
+            bottom, text="DB 동기화",
+            width=130, height=38,
+            fg_color="#FF8C00", hover_color="#E07B00", text_color="white",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._sync_db
         )
-        self.status_label.pack(side="left")
+        self.sync_btn.pack(side="left")
 
         self.db_source_label = ctk.CTkLabel(
             bottom,
@@ -232,13 +239,21 @@ class App(ctk.CTk):
         )
         self.db_source_label.pack(side="left", padx=(12, 0))
 
-        ctk.CTkButton(
+        self.status_label = ctk.CTkLabel(
+            bottom,
+            text="파일을 추가한 후 [검토 시작]을 눌러주세요.",
+            font=ctk.CTkFont(size=11)
+        )
+        self.status_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
+
+        self.report_btn = ctk.CTkButton(
             bottom, text="리포트 저장 (Excel)",
             width=170, height=38,
             fg_color="#28A745", hover_color="#218838",
             font=ctk.CTkFont(size=13, weight="bold"),
             command=self._save_report
-        ).pack(side="right", padx=(8, 0))
+        )
+        self.report_btn.pack(side="right", padx=(8, 0))
 
         self.review_btn = ctk.CTkButton(
             bottom, text="검토 시작",
@@ -247,15 +262,6 @@ class App(ctk.CTk):
             command=self._start_review
         )
         self.review_btn.pack(side="right")
-
-        self.sync_btn = ctk.CTkButton(
-            bottom, text="DB 동기화",
-            width=130, height=38,
-            fg_color="#FF8C00", hover_color="#E07B00", text_color="white",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            command=self._sync_db
-        )
-        self.sync_btn.pack(side="right", padx=(0, 8))
 
         self._refresh_count()
         self._update_db_source_label()
@@ -335,9 +341,13 @@ class App(ctk.CTk):
     def _update_db_source_label(self):
         if not hasattr(self, "db_source_label"):
             return
-        self.db_source_label.configure(
-            text=f"DB: {self.db_source} ({len(self.master_names)}개)"
-        )
+        count = len(self.master_names)
+        if self.db_source == "서버":
+            updated = self.db_updated_on or datetime.now().strftime("%Y-%m-%d")
+            text = f"DB: 서버 ({count}개 · {updated} 갱신)"
+        else:
+            text = f"DB: 내장 ({count}개)"
+        self.db_source_label.configure(text=text)
 
     def _build_drop_hint(self, parent):
         self.drop_hint_label = None
@@ -689,6 +699,7 @@ class App(ctk.CTk):
         self.matcher = NameMatcher(self.master_names)
         self.engine = ReviewEngine(self.matcher)
         self.db_source = "서버"
+        self.db_updated_on = datetime.now().strftime("%Y-%m-%d")
         self._update_db_source_label()
 
         self._log(f"동기화 완료 ({len(self.master_names)}개 명칭 로드)")
