@@ -7,6 +7,7 @@ import re
 import bisect
 from datetime import datetime
 from difflib import SequenceMatcher
+from typing import Optional
 
 _LAST_MASTER_LOAD_ERROR = ""
 
@@ -86,33 +87,100 @@ def extract_from_docx(filepath: str) -> list:
 
 
 def extract_from_hwp(filepath: str) -> list:
-    texts = []
-    hwp = None
+    import struct
+    import zlib
+
     try:
-        import pyhwpx
-        hwp = pyhwpx.Hwp(visible=False)
-        hwp.open(filepath)
-        raw = hwp.get_text()
-        if isinstance(raw, str):
-            lines = raw.split('\n')
-        elif isinstance(raw, list):
-            lines = [str(x) for x in raw]
-        else:
-            lines = [str(raw)]
-        for i, line in enumerate(lines, 1):
-            line = line.strip()
-            if line:
-                texts.append((f"HWP L{i}", line))
-    except ImportError:
-        raise ImportError("HWP: pyhwpx와 한컴오피스가 필요합니다.")
+        import olefile
+    except ImportError as e:
+        raise ImportError("HWP 파싱을 위해 olefile 패키지가 필요합니다.") from e
+
+    texts = []
+    line_num = 0
+
+    try:
+        if not olefile.isOleFile(filepath):
+            raise ValueError("OLE 형식의 .hwp 파일이 아닙니다.")
+
+        with olefile.OleFileIO(filepath) as hwp:
+            if not hwp.exists("FileHeader"):
+                raise ValueError("FileHeader 스트림을 찾지 못했습니다.")
+
+            header_data = hwp.openstream("FileHeader").read()
+            is_compressed = (
+                len(header_data) > 36 and (header_data[36] & 1) == 1
+            )
+
+            section_nums = []
+            for entry in hwp.listdir(streams=True, storages=False):
+                if (
+                    len(entry) >= 2
+                    and entry[0] == "BodyText"
+                    and entry[1].startswith("Section")
+                ):
+                    try:
+                        section_nums.append(
+                            int(entry[1].replace("Section", ""))
+                        )
+                    except ValueError:
+                        continue
+            section_nums = sorted(set(section_nums))
+
+            for snum in section_nums:
+                stream_name = f"BodyText/Section{snum}"
+                if not hwp.exists(stream_name):
+                    continue
+
+                data = hwp.openstream(stream_name).read()
+                if is_compressed:
+                    try:
+                        data = zlib.decompress(data, -15)
+                    except zlib.error:
+                        continue
+
+                i = 0
+                data_len = len(data)
+                while i + 4 <= data_len:
+                    header_val = struct.unpack_from("<I", data, i)[0]
+                    rec_type = header_val & 0x3FF
+                    rec_len = (header_val >> 20) & 0xFFF
+                    i += 4
+
+                    if rec_len == 0xFFF:
+                        if i + 4 > data_len:
+                            break
+                        rec_len = struct.unpack_from("<I", data, i)[0]
+                        i += 4
+
+                    if rec_len < 0 or i + rec_len > data_len:
+                        break
+
+                    if rec_type == 67:
+                        try:
+                            raw = data[i:i + rec_len]
+                            text = raw.decode("utf-16-le", errors="ignore")
+
+                            clean_chars = []
+                            for ch in text:
+                                if ch in ("\r", "\n"):
+                                    continue
+                                if ord(ch) < 32:
+                                    continue
+                                clean_chars.append(ch)
+
+                            clean = "".join(clean_chars).strip()
+                            if clean:
+                                line_num += 1
+                                texts.append((f"HWP L{line_num}", clean))
+                        except Exception:
+                            pass
+
+                    i += rec_len
     except Exception as e:
-        raise Exception(f"HWP 읽기 실패: {e}")
-    finally:
-        if hwp:
-            try:
-                hwp.quit()
-            except Exception:
-                pass
+        raise RuntimeError(f"HWP 읽기 실패: {e}") from e
+
+    if not texts:
+        raise RuntimeError("HWP 읽기 실패: 본문 텍스트를 찾지 못했습니다.")
     return texts
 
 
@@ -196,13 +264,22 @@ def extract_text_from_file(filepath: str, include_pdf_tables: bool = False) -> l
     return func(filepath)
 
 
-def fetch_master_from_server(url: str, timeout: int = 10) -> list:
+def fetch_master_from_server(url: str, timeout: int = 10) -> tuple[list, Optional[str]]:
     import csv
     import io
+    from email.utils import parsedate_to_datetime
     import requests
 
     response = requests.get(url, timeout=timeout)
     response.raise_for_status()
+
+    db_date = None
+    last_modified = response.headers.get("Last-Modified")
+    if last_modified:
+        try:
+            db_date = parsedate_to_datetime(last_modified).strftime("%Y-%m-%d")
+        except (TypeError, ValueError, OverflowError):
+            db_date = None
 
     raw_text = _decode_master_csv_text(response.content)
     reader = csv.reader(io.StringIO(raw_text))
@@ -211,7 +288,7 @@ def fetch_master_from_server(url: str, timeout: int = 10) -> list:
     if len(names) < 10:
         raise ValueError("서버 데이터가 너무 적습니다")
 
-    return names
+    return names, db_date
 
 
 # ═══════════════════════════════════════════════════════════
@@ -417,21 +494,21 @@ DEFAULT_MASTER_NAMES = [
 ]
 
 
-def load_master_names(url: str = None) -> tuple[list, str]:
+def load_master_names(url: str = None) -> tuple[list, str, Optional[str]]:
     global _LAST_MASTER_LOAD_ERROR
 
     _LAST_MASTER_LOAD_ERROR = ""
     fallback_names = _sanitize_master_names(DEFAULT_MASTER_NAMES)
 
     if not url:
-        return fallback_names, "내장DB"
+        return fallback_names, "내장", None
 
     try:
-        names = fetch_master_from_server(url)
-        return names, "서버"
+        names, db_date = fetch_master_from_server(url)
+        return names, "서버", db_date
     except Exception as e:
         _LAST_MASTER_LOAD_ERROR = str(e)
-        return fallback_names, "내장DB"
+        return fallback_names, "내장", None
 
 
 def get_last_master_load_error() -> str:

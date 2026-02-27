@@ -55,7 +55,7 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
 
-        self.master_names, self.db_source = load_master_names(MASTER_DB_URL)
+        self.master_names, self.db_source, self.db_date = load_master_names(MASTER_DB_URL)
         self.is_server_synced = self.db_source == "서버"
         self._startup_db_error = get_last_master_load_error()
         self.matcher = NameMatcher(self.master_names)
@@ -227,6 +227,17 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color="#2F5496"
         )
+        self.sync_db_btn = ctk.CTkButton(
+            bottom,
+            text="DB동기",
+            width=96,
+            height=32,
+            fg_color="#6C757D",
+            hover_color="#5A6268",
+            text_color="white",
+            command=self._sync_db
+        )
+        self.sync_db_btn.pack(side="left", padx=(0, 8))
         self.db_source_label.pack(side="left", padx=(0, 0))
 
         self.status_label = ctk.CTkLabel(
@@ -333,9 +344,16 @@ class App(ctk.CTk):
             return
         count = len(self.master_names)
         if self.is_server_synced:
-            text = f"DB상태 : {count}개(서버동기)"
+            if self.db_date:
+                try:
+                    date_text = datetime.strptime(self.db_date, "%Y-%m-%d").strftime("%y/%m/%d")
+                except ValueError:
+                    date_text = self.db_date
+                text = f"DB서버 : {count}개(동기성공-{date_text}기점)"
+            else:
+                text = f"DB서버 : {count}개(동기성공)"
         else:
-            text = f"DB상태 : {count}개(서버미동기)"
+            text = f"DB서버 : {count}개(동기실패)"
         self.db_source_label.configure(text=text)
 
     def _build_drop_hint(self, parent):
@@ -463,11 +481,16 @@ class App(ctk.CTk):
         self.review_btn.configure(
             state="disabled", text="검토 중..."
         )
+        if hasattr(self, "sync_db_btn"):
+            self.sync_db_btn.configure(state="disabled")
 
     def _unlock_ui(self):
         self.review_btn.configure(
             state="normal", text="검토 시작"
         )
+        if hasattr(self, "sync_db_btn"):
+            state = "disabled" if self.is_syncing else "normal"
+            self.sync_db_btn.configure(state=state)
 
     # ── 검토 ──
     def _start_review(self):
@@ -646,6 +669,8 @@ class App(ctk.CTk):
         if self.is_reviewing or self.is_syncing:
             return
         self.is_syncing = True
+        if hasattr(self, "sync_db_btn"):
+            self.sync_db_btn.configure(state="disabled", text="동기중...")
         self._log("DB 동기화 시도 중...")
         self._set_status("DB 동기화 시도 중...")
 
@@ -654,11 +679,11 @@ class App(ctk.CTk):
 
     def _run_sync_db(self):
         try:
-            names, source = load_master_names(MASTER_DB_URL)
+            names, source, db_date = load_master_names(MASTER_DB_URL)
             if source != "서버":
                 error = get_last_master_load_error() or "서버 DB 동기화 실패"
                 raise RuntimeError(error)
-            self._sync_queue.put(("success", names))
+            self._sync_queue.put(("success", (names, db_date)))
         except Exception as e:
             self._sync_queue.put(("failure", str(e)))
 
@@ -680,17 +705,21 @@ class App(ctk.CTk):
             except tk.TclError:
                 pass
 
-    def _apply_synced_master(self, names: list):
+    def _apply_synced_master(self, payload):
+        names, db_date = payload
         self.master_names = list(dict.fromkeys(names))
         self.matcher = NameMatcher(self.master_names)
         self.engine = ReviewEngine(self.matcher)
         self.db_source = "서버"
+        self.db_date = db_date
         self.is_server_synced = True
         self._update_db_source_label()
 
         self._log(f"동기화 완료 ({len(self.master_names)}개 명칭 로드)")
         self._set_status(f"DB 동기화 완료 ({len(self.master_names)}개)")
         self.is_syncing = False
+        if hasattr(self, "sync_db_btn"):
+            self.sync_db_btn.configure(state="normal", text="DB동기")
 
     def _apply_sync_failure(self, error_message: str):
         self._log(
@@ -698,9 +727,13 @@ class App(ctk.CTk):
             f"기존 DB 유지 ({len(self.master_names)}개)"
         )
         self._set_status("DB 동기화 실패 (기존 DB 유지)")
+        self.db_source = "내장"
+        self.db_date = None
         self.is_server_synced = False
         self._update_db_source_label()
         self.is_syncing = False
+        if hasattr(self, "sync_db_btn"):
+            self.sync_db_btn.configure(state="normal", text="DB동기")
 
     def _save_report(self):
         if self.is_reviewing:
