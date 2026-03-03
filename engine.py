@@ -1589,6 +1589,10 @@ class ReviewEngine:
         if full_text:
             match_events = []
             matched_offset_indices = set()
+            # 미검출 조각 보조 탐색 시 동일 텍스트 재평가를 피하기 위한 캐시.
+            aux_candidate_cache: dict[str, list[str]] = {}
+            has_korean_re = re.compile(r"[가-힣]")
+            min_aux_length = self.matcher.min_bare_length * 0.5
 
             # 공식명칭 직접 매칭은 경고 판정을 위해 좌/우 부착 문자를 포함한다.
             for match in self.matcher._official_pattern.finditer(full_text):
@@ -1623,9 +1627,31 @@ class ReviewEngine:
             for idx, (_, _, location, source_text) in enumerate(offsets):
                 if idx in matched_offset_indices:
                     continue
-                if len(source_text) > 80:
+                text = source_text.strip()
+                if len(text) > 80:
                     continue
-                for candidate in self.matcher.find_all_in_text(source_text):
+                # 1) 짧은 조각은 공사명 후보 가능성이 낮아 조기 제외한다.
+                if len(text) < 2:
+                    continue
+                # 2) 라벨/헤더 등 제외 단어는 보조 탐색 대상에서 제외한다.
+                if text in self.matcher.EXCLUDE_WORDS:
+                    continue
+                # 3) 한글이 없는 조각(숫자/영문 위주)은 탐색을 생략한다.
+                if not has_korean_re.search(text):
+                    continue
+                # 4) 마스터 최소 순수명칭 길이 대비 과도하게 짧은 조각은 제외한다.
+                if min_aux_length > 0 and len(text) < min_aux_length:
+                    continue
+                # 5) 공백이 포함된 문장형 텍스트는 보조 탐색 비용만 크므로 제외한다.
+                if " " in text and "(" not in text and ")" not in text:
+                    continue
+
+                cached_candidates = aux_candidate_cache.get(text)
+                if cached_candidates is None:
+                    cached_candidates = self.matcher.find_all_in_text(text)
+                    aux_candidate_cache[text] = cached_candidates
+
+                for candidate in cached_candidates:
                     consume_candidate(candidate, location)
 
         matched = sum(1 for r in results if r["status"] == "일치")

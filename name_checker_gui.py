@@ -169,14 +169,17 @@ class App(ctk.CTk):
         lf.pack(fill="both", expand=True, padx=10, pady=8)
 
         sb = tk.Scrollbar(lf)
-        sb.pack(side="right", fill="y")
+        sb.pack(side="right", fill="y", padx=(0, 4), pady=(8, 4))
 
         self.file_listbox = tk.Listbox(
             lf, font=("맑은 고딕", 10),
             selectmode=tk.EXTENDED, activestyle="none",
+            bg="white",
             yscrollcommand=sb.set
         )
-        self.file_listbox.pack(fill="both", expand=True)
+        self.file_listbox.pack(
+            fill="both", expand=True, padx=(4, 2), pady=(8, 4)
+        )
         sb.config(command=self.file_listbox.yview)
 
         self._build_drop_hint(lf)
@@ -304,7 +307,7 @@ class App(ctk.CTk):
             if p not in self.file_paths:
                 self.file_paths.append(p)
                 self.file_listbox.insert(
-                    tk.END, os.path.basename(p)
+                    tk.END, self._format_listbox_item(os.path.basename(p))
                 )
         self._refresh_count()
 
@@ -322,7 +325,9 @@ class App(ctk.CTk):
                     fp = os.path.join(root, f)
                     if fp not in self.file_paths:
                         self.file_paths.append(fp)
-                        self.file_listbox.insert(tk.END, f)
+                        self.file_listbox.insert(
+                            tk.END, self._format_listbox_item(f)
+                        )
                         added += 1
         self._refresh_count()
         if added == 0:
@@ -360,6 +365,11 @@ class App(ctk.CTk):
         else:
             self._hide_drop_hint()
 
+    @staticmethod
+    def _format_listbox_item(filename: str) -> str:
+        """파일 목록 표시용 텍스트에 좌우 여백을 적용한다."""
+        return f"  {filename}  "
+
     def _update_db_source_label(self):
         if not hasattr(self, "db_source_label"):
             return
@@ -386,7 +396,12 @@ class App(ctk.CTk):
         if Image is not None and os.path.exists(image_path):
             try:
                 with Image.open(image_path) as src:
-                    pil_image = src.copy()
+                    pil_image = src.convert("RGBA")
+
+                # 투명 배경이 주변 UI와 어울리도록 흰색 배경에 합성한다.
+                white_bg = Image.new("RGBA", pil_image.size, (255, 255, 255, 255))
+                white_bg.paste(pil_image, (0, 0), pil_image)
+                pil_image = white_bg
 
                 width, height = pil_image.size
                 target_width = 280
@@ -400,6 +415,7 @@ class App(ctk.CTk):
                 self.drop_hint_image_label = ctk.CTkLabel(
                     parent,
                     text="",
+                    fg_color="transparent",
                     image=self.drop_hint_image
                 )
                 return
@@ -491,7 +507,9 @@ class App(ctk.CTk):
                     continue
 
                 self.file_paths.append(fp)
-                self.file_listbox.insert(tk.END, os.path.basename(fp))
+                self.file_listbox.insert(
+                    tk.END, self._format_listbox_item(os.path.basename(fp))
+                )
 
             self._refresh_count()
         except Exception as e:
