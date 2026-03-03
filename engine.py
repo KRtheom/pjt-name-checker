@@ -1786,7 +1786,7 @@ def generate_highlight_snapshots(
 
     Args:
         filepath: PDF 파일 경로.
-        ng_items: 불일치 항목 목록(`{"input": str, "location": str, ...}`).
+        ng_items: 불일치 항목 목록(``{"input": str, "location": str, ...}``).
         scale: 이미지 렌더링 배율(기본 2배).
 
     Returns:
@@ -1800,7 +1800,7 @@ def generate_highlight_snapshots(
     if os.path.splitext(filepath)[1].lower() != ".pdf":
         return []
 
-    # 페이지별 검색어를 묶어 페이지 렌더링을 최소화한다.
+    # ── 페이지별 검색어 수집 ──
     page_targets: dict[int, list[str]] = {}
     for item in ng_items:
         location = item.get("location", "")
@@ -1809,12 +1809,17 @@ def generate_highlight_snapshots(
             continue
         page_num = int(m.group(1))
 
-        # 검색어는 앞쪽 특수기호를 제거해 검색 성공률을 높인다.
-        search_text = item.get("input", "").strip()
-        search_text = search_text.lstrip(STRIP_CHARS).strip()
-        if not search_text or len(search_text) < 2:
+        # 입력 텍스트에서 순수명칭만 추출한다.
+        raw = item.get("input", "").strip()
+        # 1단계: 앞쪽 특수기호 제거 (▶, ■ 등)
+        cleaned = raw.lstrip(STRIP_CHARS).strip()
+        # 2단계: 접두어 제거 → 순수명칭 추출
+        _, bare = split_official_name(cleaned)
+        # 순수명칭이 비어있으면 정제된 원문 사용
+        search_base = bare if bare else cleaned
+        if not search_base or len(search_base) < 2:
             continue
-        page_targets.setdefault(page_num, []).append(search_text)
+        page_targets.setdefault(page_num, []).append(search_base)
 
     if not page_targets:
         return []
@@ -1829,37 +1834,42 @@ def generate_highlight_snapshots(
                     continue
                 page = doc[page_num - 1]
                 targets = page_targets[page_num]
+                highlighted = False  # 이 페이지에 하이라이트가 있는지 추적
 
                 for search_text in targets:
-                    # 1차: 원문 문자열 검색
+                    rects = []
+
+                    # 1차: 순수명칭 전체 검색
                     rects = page.search_for(search_text)
 
-                    # 2차: 접두어 제거 순수명칭 검색
-                    if not rects:
-                        _, bare = split_official_name(search_text)
-                        if bare and bare != search_text:
-                            rects = page.search_for(bare)
-
-                    # 3차: 앞 4글자 검색
+                    # 2차: 앞 4글자 폴백 (한글 기준)
                     if not rects and len(search_text) >= 4:
                         rects = page.search_for(search_text[:4])
 
+                    # 3차: 앞 3글자 폴백
+                    if not rects and len(search_text) >= 3:
+                        rects = page.search_for(search_text[:3])
+
+                    # draw_rect로 직접 그려 get_pixmap()에 반영한다.
                     for rect in rects:
                         expanded = fitz.Rect(
                             rect.x0 - 2, rect.y0 - 2,
                             rect.x1 + 20, rect.y1 + 2
                         )
-                        # 가시성을 위해 빨간 테두리 + 노란 하이라이트를 함께 표시한다.
-                        annot = page.add_rect_annot(expanded)
-                        annot.set_colors(stroke=(1, 0, 0))
-                        annot.set_border(width=2)
-                        annot.update()
+                        # 노란 반투명 배경 + 빨간 테두리
+                        page.draw_rect(
+                            expanded,
+                            color=(1, 0, 0),
+                            width=2,
+                            fill=(1, 1, 0),
+                            fill_opacity=0.3,
+                        )
+                        highlighted = True
 
-                        highlight = page.add_highlight_annot(expanded)
-                        highlight.update()
-
-                pix = page.get_pixmap(matrix=mat)
-                results.append((page_num, pix.tobytes("png")))
+                # 하이라이트가 있는 페이지만 스냅샷에 포함한다.
+                if highlighted:
+                    pix = page.get_pixmap(matrix=mat)
+                    results.append((page_num, pix.tobytes("png")))
         finally:
             doc.close()
     except Exception:
