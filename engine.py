@@ -1,5 +1,18 @@
 """
-engine.py - 공사명칭 검토 엔진 v3.0
+공사명칭 검토 엔진 모듈.
+
+목적:
+    보고서 파일(PDF/HWP/XLSX 등)에서 추출한 텍스트를
+    마스터 DB의 공식 공사명칭과 비교하여 일치/경고/불일치를 판정한다.
+
+주요 기능:
+    - 파일 형식별 텍스트 추출
+    - 마스터 명칭 로드(내장/서버)
+    - 접두어 분리 기반 보정 매칭
+    - 검토 결과 Excel 리포트 생성
+
+버전:
+    v3.1
 """
 
 import os
@@ -9,16 +22,42 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Optional
 
+# 마지막 마스터 로드 실패 사유(서버 동기화 실패 메시지 보관)
 _LAST_MASTER_LOAD_ERROR = ""
 
 
 # ═══════════════════════════════════════════════════════════
 #  파일 텍스트 추출 (지연 import)
 # ═══════════════════════════════════════════════════════════
+# 지원하는 입력 파일 확장자 목록
 SUPPORTED_EXTENSIONS = {'.xlsx', '.pdf', '.docx', '.hwp', '.hwpx', '.csv'}
+
+# 마스터DB 공식명칭에 사용되는 접두어 목록
+# 긴 접두어부터 매칭하기 위해 사용 시 길이 역순 정렬이 필요하다.
+KNOWN_PREFIXES: tuple[str, ...] = (
+    "민참.분양", "자체.시공", "자체.시행", "자체.공모", "시행도급",
+    "순수내역", "민간", "종평", "적격", "기본", "종심", "턴키",
+    "해외", "통합", "도로", "영업", "도전", "도운", "국운",
+    "지운", "민운", "민임", "실시", "자체", "민참",
+    "CM", "BOT", "BTL", "BTO", "ITS",
+)
+
+# PDF/HWP 추출 시 명칭 앞에 붙는 특수기호
+STRIP_CHARS = "▶□■❑◆●○◇△▽☆★※→←↑↓·"
+
+# 공식명칭 접두어 파싱용 정규식
+PREFIX_PATTERN = re.compile(r'^\(([^)]*)\)\s*(.*)$')
 
 
 def extract_from_xlsx(filepath: str) -> list:
+    """엑셀 파일에서 셀 텍스트를 추출한다.
+
+    Args:
+        filepath: `.xlsx` 파일 경로.
+
+    Returns:
+        `(위치, 텍스트)` 튜플 목록.
+    """
     from openpyxl import load_workbook
     texts = []
     wb = load_workbook(filepath, data_only=True)
@@ -35,6 +74,14 @@ def extract_from_xlsx(filepath: str) -> list:
 
 
 def extract_from_pdf(filepath: str) -> list:
+    """PDF 파일에서 줄 단위 텍스트를 추출한다.
+
+    Args:
+        filepath: `.pdf` 파일 경로.
+
+    Returns:
+        `(위치, 텍스트)` 튜플 목록.
+    """
     texts = []
 
     try:
@@ -70,6 +117,14 @@ def extract_from_pdf(filepath: str) -> list:
 
 
 def extract_from_docx(filepath: str) -> list:
+    """DOCX 파일에서 문단/표 텍스트를 추출한다.
+
+    Args:
+        filepath: `.docx` 파일 경로.
+
+    Returns:
+        `(위치, 텍스트)` 튜플 목록.
+    """
     from docx import Document
     texts = []
     doc = Document(filepath)
@@ -87,6 +142,17 @@ def extract_from_docx(filepath: str) -> list:
 
 
 def extract_from_hwp(filepath: str) -> list:
+    """HWP(OLE) 파일에서 본문 텍스트를 추출한다.
+
+    Args:
+        filepath: `.hwp` 파일 경로.
+
+    Returns:
+        `(위치, 텍스트)` 튜플 목록.
+
+    Raises:
+        RuntimeError: 파일 파싱 또는 본문 추출에 실패한 경우.
+    """
     import struct
     import zlib
 
@@ -185,7 +251,17 @@ def extract_from_hwp(filepath: str) -> list:
 
 
 def extract_from_hwpx(filepath: str) -> list:
-    """신형 .hwpx 파일 - ZIP + XML 파싱"""
+    """HWPX(ZIP+XML) 파일에서 본문 텍스트를 추출한다.
+
+    Args:
+        filepath: `.hwpx` 파일 경로.
+
+    Returns:
+        `(위치, 텍스트)` 튜플 목록.
+
+    Raises:
+        RuntimeError: 파일 열기 또는 XML 파싱에 실패한 경우.
+    """
     import zipfile
     from xml.etree import ElementTree as ET
 
@@ -227,6 +303,17 @@ def extract_from_hwpx(filepath: str) -> list:
 
 
 def extract_from_csv(filepath: str) -> list:
+    """CSV 파일을 다중 인코딩으로 읽어 텍스트를 추출한다.
+
+    Args:
+        filepath: `.csv` 파일 경로.
+
+    Returns:
+        `(위치, 텍스트)` 튜플 목록.
+
+    Raises:
+        ValueError: 지원 인코딩으로 디코딩할 수 없는 경우.
+    """
     import csv
 
     texts = []
@@ -247,6 +334,17 @@ def extract_from_csv(filepath: str) -> list:
 
 
 def extract_text_from_file(filepath: str, include_pdf_tables: bool = False) -> list:
+    """파일 확장자에 따라 적절한 텍스트 추출기를 호출한다.
+
+    Args:
+        filepath: 입력 파일 경로.
+        include_pdf_tables: 호환용 인자(현재 미사용).
+
+    Returns:
+        `(위치, 텍스트)` 튜플 목록.
+    """
+    # 향후 호환을 위해 인자는 유지한다.
+    _ = include_pdf_tables
     ext = os.path.splitext(filepath)[1].lower()
     if ext == ".pdf":
         return extract_from_pdf(filepath)
@@ -265,6 +363,15 @@ def extract_text_from_file(filepath: str, include_pdf_tables: bool = False) -> l
 
 
 def fetch_master_from_server(url: str, timeout: int = 10) -> tuple[list, Optional[str]]:
+    """서버 CSV를 내려받아 마스터 명칭 목록을 로드한다.
+
+    Args:
+        url: 마스터 CSV URL.
+        timeout: HTTP 타임아웃(초).
+
+    Returns:
+        `(정제된 명칭 목록, DB 기준일)` 튜플.
+    """
     import csv
     import io
     from email.utils import parsedate_to_datetime
@@ -295,6 +402,14 @@ def fetch_master_from_server(url: str, timeout: int = 10) -> tuple[list, Optiona
 #  기본 마스터 명칭
 # ═══════════════════════════════════════════════════════════
 def _sanitize_master_names(raw_names: list) -> list:
+    """마스터 명칭 원본 목록을 중복 제거/정제한다.
+
+    Args:
+        raw_names: 원본 명칭 목록.
+
+    Returns:
+        공백/중복/`None`이 제거된 명칭 목록.
+    """
     sanitized = []
     seen = set()
     for raw in raw_names:
@@ -309,12 +424,96 @@ def _sanitize_master_names(raw_names: list) -> list:
 
 
 def _decode_master_csv_text(raw: bytes) -> str:
+    """마스터 CSV 바이트를 가능한 인코딩으로 디코딩한다.
+
+    Args:
+        raw: CSV 원본 바이트.
+
+    Returns:
+        디코딩된 문자열.
+    """
     for encoding in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
         try:
             return raw.decode(encoding)
         except UnicodeDecodeError:
             continue
     return raw.decode("utf-8", errors="replace")
+
+
+def strip_known_prefix(text: str) -> tuple[str, str]:
+    """텍스트 앞에 붙은 알려진 접두어를 분리한다.
+
+    PDF 추출 시 "(종심)포항안동도로"가 "종심포항안동도로"로 합쳐지는
+    경우를 처리하기 위한 전처리 함수.
+
+    Args:
+        text: 검사 대상 문자열.
+
+    Returns:
+        `(접두어, 순수명칭)` 튜플. 접두어 미발견 시 `("", 원본)` 반환.
+
+    Examples:
+        "종심포항안동도로" -> ("종심", "포항안동도로")
+        "(종심)포항안동도로" -> ("종심", "포항안동도로")
+        "▶ 시행도급대전죽동오피스텔" -> ("시행도급", "대전죽동오피스텔")
+        "포항안동도로" -> ("", "포항안동도로")
+    """
+    raw = str(text or "")
+    cleaned = raw.strip().strip(STRIP_CHARS).strip()
+    if not cleaned:
+        return "", ""
+
+    # 1) (접두어)명칭 형태 우선 분리
+    pm = PREFIX_PATTERN.match(cleaned)
+    if pm:
+        prefix = pm.group(1).strip()
+        bare = pm.group(2).strip()
+        if prefix and bare:
+            return prefix, bare
+        return "", cleaned
+
+    # 2) 괄호 없는 접두어는 긴 접두어부터 비교하여 오탐을 줄인다.
+    for prefix in sorted(KNOWN_PREFIXES, key=len, reverse=True):
+        if cleaned.startswith(prefix):
+            bare = cleaned[len(prefix):].strip()
+            if bare:
+                return prefix, bare
+
+    return "", cleaned
+
+
+def split_official_name(name: str) -> tuple[str, str]:
+    """공식명칭을 `(접두어, 순수명칭)`으로 분리한다.
+
+    Args:
+        name: 마스터 공식명칭.
+
+    Returns:
+        `(접두어, 순수명칭)` 튜플.
+    """
+    clean = str(name or "").strip()
+    pm = PREFIX_PATTERN.match(clean)
+    if pm:
+        return pm.group(1).strip(), pm.group(2).strip()
+    return strip_known_prefix(clean)
+
+
+def build_bare_name_index(master_names: list) -> dict[str, list[str]]:
+    """마스터 명칭으로 순수명칭 인덱스를 생성한다.
+
+    Args:
+        master_names: 공식명칭 목록.
+
+    Returns:
+        `순수명칭 -> [공식명칭, ...]` 딕셔너리.
+    """
+    index: dict[str, list[str]] = {}
+    for official in master_names:
+        _, bare = split_official_name(official)
+        if not bare:
+            continue
+        index.setdefault(bare, []).append(official)
+    return index
 
 
 DEFAULT_MASTER_NAMES = [
@@ -495,6 +694,14 @@ DEFAULT_MASTER_NAMES = [
 
 
 def load_master_names(url: str = None) -> tuple[list, str, Optional[str]]:
+    """마스터 명칭 목록을 로드한다.
+
+    Args:
+        url: 서버 CSV URL. `None`이면 내장 목록 사용.
+
+    Returns:
+        `(명칭 목록, 소스 구분, DB 기준일)` 튜플.
+    """
     global _LAST_MASTER_LOAD_ERROR
 
     _LAST_MASTER_LOAD_ERROR = ""
@@ -512,6 +719,7 @@ def load_master_names(url: str = None) -> tuple[list, str, Optional[str]]:
 
 
 def get_last_master_load_error() -> str:
+    """최근 마스터 로드 실패 메시지를 반환한다."""
     return _LAST_MASTER_LOAD_ERROR
 
 
@@ -519,7 +727,9 @@ def get_last_master_load_error() -> str:
 #  명칭 매칭 엔진 v3.0
 # ═══════════════════════════════════════════════════════════
 class NameMatcher:
+    """공사명칭 후보를 마스터 DB와 비교해 판정한다."""
 
+    # 공사명 후보로 볼 필요가 없는 공통 헤더/라벨 텍스트
     EXCLUDE_WORDS = {
         "공사명", "사업명", "현장명", "프로젝트명", "프로젝트",
         "일치여부", "일치", "불일치", "판정", "결과",
@@ -534,38 +744,48 @@ class NameMatcher:
     )
 
     def __init__(self, master_names: list):
-        self.master_names = list(master_names)
-        self.master_set = set(master_names)
+        """매칭에 필요한 인덱스/정규식을 초기화한다.
 
-        # 순수명칭(접두어 제거) → [공식명칭들]
-        self.bare_to_official = {}
-        # 마스터에 있는 후미 괄호 패턴 수집 (제거하면 안 되는 것들)
+        Args:
+            master_names: 공식명칭 목록.
+        """
+        self.master_names = list(dict.fromkeys(master_names))
+        self.master_set = set(self.master_names)
+
+        # 순수명칭 -> 공식명칭 리스트 인덱스(동일 순수명칭 다건 지원)
+        self.bare_to_official = build_bare_name_index(self.master_names)
+        self.bare_names = list(self.bare_to_official.keys())
+        self.min_bare_length = min((len(name) for name in self.bare_names), default=0)
+
+        # 공식명칭별 접두어를 캐시해 접두어 분기 비교 비용을 줄인다.
+        self.official_prefix = {
+            official: split_official_name(official)[0] for official in self.master_names
+        }
+
+        # 마스터 순수명칭에 존재하는 후미 괄호는 정규화 시 보존한다.
         self.master_suffixes = set()
-
-        for name in master_names:
-            bare = self._remove_prefix(name)
-            if bare not in self.bare_to_official:
-                self.bare_to_official[bare] = []
-            self.bare_to_official[bare].append(name)
-
-            # 마스터 순수명칭에 포함된 후미 괄호는 보존 대상
+        for bare in self.bare_names:
             suffix_match = re.search(r'\([^)]+\)$', bare)
             if suffix_match:
                 self.master_suffixes.add(suffix_match.group())
 
-        self.bare_names = list(self.bare_to_official.keys())
-        self.min_bare_length = min((len(name) for name in self.bare_names),
-                                   default=0)
         sorted_bares = sorted(self.bare_names, key=len, reverse=True)
         sorted_officials = sorted(self.master_names, key=len, reverse=True)
-        self._bare_pattern = self._compile_alternation(
-            sorted_bares, with_token_boundary=True
-        )
+        self._bare_pattern = self._compile_alternation(sorted_bares, with_token_boundary=True)
         self._official_pattern = self._compile_alternation(sorted_officials)
         self._similarity_cache = {}
 
     @staticmethod
     def _compile_alternation(items: list, with_token_boundary: bool = False):
+        """문자열 목록을 OR 정규식으로 컴파일한다.
+
+        Args:
+            items: 패턴으로 만들 문자열 목록.
+            with_token_boundary: 토큰 경계 보호 여부.
+
+        Returns:
+            컴파일된 정규식 객체.
+        """
         escaped_items = [re.escape(item) for item in items if item]
         if not escaped_items:
             return re.compile(r"(?!x)x")
@@ -578,33 +798,61 @@ class NameMatcher:
 
     @staticmethod
     def _remove_prefix(name: str) -> str:
-        """앞쪽 접두어 (민간), (CM) 등 제거"""
-        return re.sub(r'^\([^)]*\)', '', name).strip()
+        """앞쪽 접두어를 제거한 순수명칭을 반환한다.
+
+        Deprecated: split_official_name()을 사용할 것.
+
+        Args:
+            name: 원본 문자열.
+
+        Returns:
+            접두어가 제거된 순수명칭.
+        """
+        _, bare = split_official_name(name)
+        return bare
 
     @staticmethod
     def _has_prefix(name: str) -> bool:
-        return bool(re.match(r'^\([^)]+\)', name))
+        """문자열이 `(접두어)`로 시작하는지 확인한다.
+
+        Args:
+            name: 검사 대상 문자열.
+
+        Returns:
+            접두어 시작 여부.
+        """
+        return bool(PREFIX_PATTERN.match(name.strip()))
 
     def _normalize(self, text: str) -> str:
-        """
-        보고서 명칭 정규화:
-        1) 앞쪽 접두어 제거
-        2) 뒤쪽 노이즈 괄호 제거 (단, 마스터에 있는 괄호는 유지)
-        """
-        # 접두어 제거
-        result = self._remove_prefix(text)
+        """비교를 위해 텍스트를 정규화한다.
 
-        # 후미 괄호 확인
+        Args:
+            text: 원본 후보 문자열.
+
+        Returns:
+            접두어/노이즈 후미 괄호를 정리한 문자열.
+        """
+        # 인덱스 키 생성 경로와 조회 경로를 동일화하기 위해 split_official_name()을 사용한다.
+        _, result = split_official_name(text.strip())
+
+        # 후미 괄호가 마스터에 없는 노이즈라면 제거한다.
         suffix_match = re.search(r'\([^)]+\)$', result)
         if suffix_match:
             suffix = suffix_match.group()
-            # 마스터에 있는 후미 괄호면 유지, 아니면 제거
             if suffix not in self.master_suffixes:
                 result = result[:suffix_match.start()].strip()
 
         return result
 
     def _is_excluded(self, text: str) -> bool:
+        """후보 제외 대상 텍스트인지 판정한다.
+
+        Args:
+            text: 검사 대상 문자열.
+
+        Returns:
+            제외 대상 여부.
+        """
         clean = text.strip()
         if clean in self.EXCLUDE_WORDS:
             return True
@@ -615,23 +863,36 @@ class NameMatcher:
         return False
 
     def _find_containing_matches(self, normalized: str) -> list:
-        """
-        정규화된 명칭이 마스터 순수명칭에 포함되거나
-        마스터 순수명칭이 정규화된 명칭에 포함되는 경우 찾기
+        """포함 관계 기반 후보 공식명칭 목록을 찾는다.
+
+        Args:
+            normalized: 정규화된 입력 문자열.
+
+        Returns:
+            포함 관계가 성립한 공식명칭 목록.
         """
         matches = []
         for bare, officials in self.bare_to_official.items():
             if len(bare) < 4 or len(normalized) < 4:
                 continue
-            # 양방향 포함 관계 확인
+            # 접두어 누락/불완전 입력을 잡기 위해 양방향 포함을 허용한다.
             if bare.startswith(normalized) or normalized.startswith(bare):
                 for off in officials:
-                    matches.append(off)
+                    if off not in matches:
+                        matches.append(off)
         return matches
 
     @staticmethod
     def _contains_bare_token(text: str, bare: str) -> bool:
-        """순수명칭이 더 긴 토큰의 부분문자열이 아닌지 경계 포함 확인"""
+        """순수명칭이 독립 토큰으로 등장하는지 검사한다.
+
+        Args:
+            text: 검사 대상 문자열.
+            bare: 순수명칭.
+
+        Returns:
+            독립 토큰으로 존재하면 `True`.
+        """
         token_re = re.compile(
             rf'(?<![0-9A-Za-z가-힣]){re.escape(bare)}(?![0-9A-Za-z가-힣])'
         )
@@ -639,9 +900,14 @@ class NameMatcher:
 
     @staticmethod
     def _extract_prefixed_candidate(text: str, bare: str):
-        """
-        텍스트 안에서 '(접두어)순수명칭' 형태를 찾아 원문 후보로 반환.
-        더 긴 토큰의 부분문자열 매칭은 제외한다.
+        """텍스트에서 `(접두어)순수명칭` 형태 후보를 추출한다.
+
+        Args:
+            text: 원문 문자열.
+            bare: 순수명칭.
+
+        Returns:
+            원문 후보 문자열 또는 `None`.
         """
         prefixed_re = re.compile(
             rf'(\([^)]+\)\s*{re.escape(bare)})(?![0-9A-Za-z가-힣])'
@@ -651,8 +917,102 @@ class NameMatcher:
             return m.group(1).strip()
         return None
 
+    @staticmethod
+    def _is_side_boundary(text: str, index: int, is_left: bool) -> bool:
+        """공식명칭 좌/우 경계가 정상인지 확인한다.
+
+        Args:
+            text: 원문 텍스트.
+            index: 경계 인덱스.
+            is_left: 왼쪽 경계 검사 여부.
+
+        Returns:
+            시작/끝 또는 공백 경계면 `True`.
+        """
+        if is_left and index <= 0:
+            return True
+        if (not is_left) and index >= len(text):
+            return True
+        ch = text[index - 1] if is_left else text[index]
+        return ch.isspace()
+
+    @staticmethod
+    def _build_warning_issue(front_ok: bool, back_ok: bool, official: str) -> str:
+        """경고 메시지를 규격화한다.
+
+        Args:
+            front_ok: 앞 경계 정상 여부.
+            back_ok: 뒤 경계 정상 여부.
+            official: 대응 공식명칭.
+
+        Returns:
+            경고 사유 문자열.
+        """
+        if not front_ok and not back_ok:
+            side = "앞/뒤"
+        elif not front_ok:
+            side = "앞"
+        else:
+            side = "뒤"
+        return f"경고: 명칭 {side} 부가문자 부착 → 공식: {official}"
+
+    def _check_official_inclusion(self, text: str) -> Optional[dict]:
+        """공식명칭 직접 포함 여부와 경계를 함께 판정한다.
+
+        Args:
+            text: 검사 대상 문자열.
+
+        Returns:
+            일치/경고 판정 dict 또는 `None`.
+        """
+        warning_result = None
+        for match in self._official_pattern.finditer(text):
+            official = match.group(0)
+            start, end = match.span()
+            front_ok = self._is_side_boundary(text, start, is_left=True)
+            back_ok = self._is_side_boundary(text, end, is_left=False)
+
+            # 공식명칭이 경계 포함으로 정확히 분리되면 즉시 통과 처리한다.
+            if front_ok and back_ok:
+                return {
+                    "input": text,
+                    "status": "일치",
+                    "suggestion": official,
+                    "issue": "",
+                }
+
+            # 앞/뒤에 문자가 붙어 있으면 경고로 기록한다.
+            if warning_result is None:
+                warning_result = {
+                    "input": text,
+                    "status": "경고",
+                    "suggestion": official,
+                    "issue": self._build_warning_issue(front_ok, back_ok, official),
+                }
+        return warning_result
+
+    @staticmethod
+    def _format_ambiguous_issue(candidates: list[str]) -> str:
+        """특정불가 사유 문자열을 포맷팅한다.
+
+        Args:
+            candidates: 유사 후보 공식명칭 목록.
+
+        Returns:
+            리포트 표기용 특정불가 사유 문자열.
+        """
+        display = " ".join([f"{i + 1}. {name}" for i, name in enumerate(candidates)])
+        return f"특정불가 (유사 {len(candidates)}건): {display}"
+
     def find_all_in_text(self, text: str) -> list:
-        """텍스트에서 마스터DB와 관련된 모든 문자열을 찾아냄"""
+        """텍스트에서 마스터DB와 연관된 후보 문자열을 찾는다.
+
+        Args:
+            text: 원문 텍스트.
+
+        Returns:
+            후보 문자열 목록.
+        """
         found = []
         text = text.strip()
         if len(text) < 3:
@@ -660,26 +1020,26 @@ class NameMatcher:
         if self._is_excluded(text):
             return []
 
-        # (A) 전체 텍스트가 공식명칭 또는 순수명칭 일치
+        # (A) 전체 텍스트가 공식명칭/순수명칭과 동일한 경우
         if text in self.master_set:
             return [text]
         if text in self.bare_to_official:
             return [text]
 
-        # (B) 정규화 후 일치 확인
+        # (B) 정규화 후 순수명칭이 맞으면 원문을 후보로 올린다.
         norm = self._normalize(text)
         if norm != text and norm in self.bare_to_official:
-            return [text]  # 원본 텍스트를 반환 (정규화 전 형태)
+            return [text]
         if len(text) < self.min_bare_length:
             return []
 
-        # (C) 텍스트 안에 공식명칭이 포함
+        # (C) 텍스트 안의 공식명칭 직접 포함 후보
         for match in self._official_pattern.finditer(text):
             official = match.group(0)
             if official not in found:
                 found.append(official)
 
-        # (D) 텍스트 안에 순수명칭이 포함
+        # (D) 텍스트 안의 순수명칭 포함 후보
         for match in self._bare_pattern.finditer(text):
             bare = match.group(0)
             officials = self.bare_to_official.get(bare)
@@ -700,14 +1060,12 @@ class NameMatcher:
             if bare not in found:
                 found.append(bare)
 
-        # (E) 포함 관계 또는 유사도 매칭
+        # (E) 정규식으로 못 잡은 경우 포함/유사도 후보를 보조 탐색한다.
         if not found:
-            # 정규화 후 포함 관계
             containing = self._find_containing_matches(norm)
             if containing:
                 return [text]
 
-            # 유사도 매칭
             best_name, best_score = self._best_similarity(norm)
             if best_score >= 0.7:
                 return [text]
@@ -715,7 +1073,14 @@ class NameMatcher:
         return found
 
     def _best_similarity(self, text: str):
-        """마스터 순수명칭들과 유사도 비교, 최고점 반환"""
+        """순수명칭 기준 최고 유사도 공식명칭을 찾는다.
+
+        Args:
+            text: 비교 대상 문자열.
+
+        Returns:
+            `(공식명칭, 유사도)` 튜플.
+        """
         cached = self._similarity_cache.get(text)
         if cached is not None:
             return cached
@@ -732,165 +1097,151 @@ class NameMatcher:
         return result
 
     def check(self, text: str) -> dict:
+        """단일 문자열을 마스터 명칭 규칙으로 판정한다.
+
+        Args:
+            text: 검사 대상 문자열.
+
+        Returns:
+            `{input, status, suggestion, issue}` 형태 dict 또는 `None`.
         """
-        단일 문자열을 마스터와 비교하여 판정
-        Returns: {input, status, suggestion, issue} or None
-        """
-        text = text.strip()
+        text = str(text or "").strip()
         if not text or self._is_excluded(text):
             return None
 
-        # ━━ STEP 0: 완전 일치 ━━
-        if text in self.master_set:
+        # STEP 1: 공식명칭 포함 + 경계 판정(통과/경고)
+        inclusion_result = self._check_official_inclusion(text)
+        if inclusion_result:
+            return inclusion_result
+
+        # STEP 2: 접두어 분리 매칭
+        normalized = self._normalize(text)
+        split_prefix, split_bare = strip_known_prefix(text)
+        split_bare = split_bare or normalized
+        stripped_input = text.strip().strip(STRIP_CHARS).strip()
+        is_direct_prefix_form = (
+            bool(split_prefix)
+            and not self._has_prefix(text)
+            and stripped_input.startswith(split_prefix)
+        )
+
+        if split_bare in self.bare_to_official:
+            officials = self.bare_to_official[split_bare]
+            if len(officials) == 1:
+                official = officials[0]
+                official_prefix = self.official_prefix.get(official, "")
+
+                if not split_prefix:
+                    return {
+                        "input": text,
+                        "status": "불일치",
+                        "suggestion": official,
+                        "issue": f"접두어 누락 → 공식: {official}",
+                    }
+
+                if split_prefix == official_prefix:
+                    return {
+                        "input": text,
+                        "status": "불일치",
+                        "suggestion": official,
+                        "issue": f"접두어 분리매칭 → 공식: {official}",
+                    }
+
+                return {
+                    "input": text,
+                    "status": "불일치",
+                    "suggestion": official,
+                    "issue": f"접두어 불일치 ({split_prefix}->{official_prefix}) → 공식: {official}",
+                }
+
             return {
-                "input": text, "status": "일치",
-                "suggestion": text, "issue": ""
+                "input": text,
+                "status": "불일치",
+                "suggestion": " / ".join(officials),
+                "issue": self._format_ambiguous_issue(officials),
             }
 
-        # ━━ 정규화 ━━
-        normalized = self._normalize(text)
-        has_prefix = self._has_prefix(text)
-        input_prefix = ""
-        if has_prefix:
-            pm = re.match(r'^\([^)]+\)', text)
-            input_prefix = pm.group() if pm else ""
-
-        # ━━ STEP 1: 정규화 후 순수명칭 완전 일치 (후보 1개) ━━
-        if normalized in self.bare_to_official:
-            officials = self.bare_to_official[normalized]
-
-            if len(officials) == 1:
-                reason = self._describe_mismatch(
-                    text, normalized, input_prefix, officials[0]
-                )
+        # 괄호 없는 "접두어+명칭" 형태는 접두어 분리 유사매칭을 우선 설명한다.
+        if is_direct_prefix_form and len(split_bare) >= 4:
+            best_split_name, best_split_score = self._best_similarity(split_bare)
+            if (
+                best_split_name
+                and best_split_score >= 0.9
+                and self.official_prefix.get(best_split_name, "") == split_prefix
+            ):
                 return {
-                    "input": text, "status": "불일치",
-                    "suggestion": officials[0],
-                    "issue": reason
+                    "input": text,
+                    "status": "불일치",
+                    "suggestion": best_split_name,
+                    "issue": f"접두어 분리매칭 → 공식: {best_split_name}",
                 }
-            else:
-                # 방어로직: STEP0에서 걸리지 않았더라도 공식명칭 완전일치면 일치
-                for off in officials:
-                    if text == off:
-                        return {
-                            "input": text, "status": "일치",
-                            "suggestion": off, "issue": ""
-                        }
 
-                # 접두어가 있으면 접두어로 특정 시도
-                if has_prefix:
-                    matched_official = None
-                    for off in officials:
-                        if off == input_prefix + normalized:
-                            matched_official = off
-                            break
-
-                    # 접두어+순수명칭이 특정되면 해당 공식명칭 기준으로 사유 생성
-                    if matched_official:
-                        reason = self._describe_mismatch(
-                            text, normalized, input_prefix, matched_official
-                        )
-                        return {
-                            "input": text, "status": "불일치",
-                            "suggestion": matched_official,
-                            "issue": reason
-                        }
-
-                    # 접두어 불일치
-                    return {
-                        "input": text, "status": "불일치",
-                        "suggestion": " / ".join(officials),
-                        "issue": f"접두어 불일치 → 후보: {' / '.join(officials)}"
-                    }
-                else:
-                    return {
-                        "input": text, "status": "불일치",
-                        "suggestion": " / ".join(officials),
-                        "issue": f"접두어 누락 → 후보: {' / '.join(officials)}"
-                    }
-
-        # ━━ STEP 2: 포함 관계 (성남복정 → 성남복정1A 등) ━━
+        # STEP 3: 기존 포함 관계/유사도 비교
         containing = self._find_containing_matches(normalized)
         if containing:
             if len(containing) == 1:
-                candidate_bare = self._remove_prefix(containing[0])
-                # 예: 성남복정1A1 -> 성남복정1A 는 불완전보다 오탈자에 가까움
+                # 포함 비교도 인덱스와 동일한 접두어 분리 경로를 사용한다.
+                _, candidate_bare = split_official_name(containing[0])
+                candidate_bare = candidate_bare.replace(" ", "")
+                compare_text = normalized.replace(" ", "")
+
+                # "공식명칭+1글자" 수준은 오탈자 가능성이 높아 유사도 단계로 넘긴다.
                 likely_typo = (
-                    normalized.startswith(candidate_bare)
-                    and len(normalized) - len(candidate_bare) <= 1
+                    compare_text.startswith(candidate_bare)
+                    and len(compare_text) - len(candidate_bare) <= 1
                 )
                 if not likely_typo:
                     return {
-                        "input": text, "status": "불일치",
+                        "input": text,
+                        "status": "불일치",
                         "suggestion": containing[0],
-                        "issue": f"명칭 불완전 → 공식: {containing[0]}"
+                        "issue": f"명칭 불완전 → 공식: {containing[0]}",
                     }
             else:
-                display = "\n".join(
-                    [f"  {i + 1}. {c}" for i, c in enumerate(containing)]
-                )
                 return {
-                    "input": text, "status": "불일치",
+                    "input": text,
+                    "status": "불일치",
                     "suggestion": " / ".join(containing),
-                    "issue": f"특정불가 (유사 {len(containing)}건):\n{display}"
+                    "issue": self._format_ambiguous_issue(containing),
                 }
 
-        # ━━ STEP 3: 유사도 매칭 ━━
         best_name, best_score = self._best_similarity(normalized)
         if best_score >= 0.7:
             pct = f"{best_score * 100:.0f}%"
             return {
-                "input": text, "status": "불일치",
+                "input": text,
+                "status": "불일치",
                 "suggestion": best_name,
-                "issue": f"오탈자 추정 (유사도 {pct}) → 공식: {best_name}"
+                "issue": f"오탈자 추정 (유사도 {pct}) → 공식: {best_name}",
             }
 
-        # ━━ STEP 4: 매칭 실패 → 공사명이 아닌 것으로 판단 ━━
+        # 공사명으로 보기 어려운 텍스트는 결과 목록에서 제외한다.
         return None
-
-    def _describe_mismatch(self, original: str, normalized: str,
-                           input_prefix: str, official: str) -> str:
-        """불일치 사유를 구체적으로 설명"""
-        reasons = []
-
-        # 접두어 문제
-        official_prefix_m = re.match(r'^\([^)]+\)', official)
-        official_prefix = official_prefix_m.group() if official_prefix_m else ""
-
-        if not input_prefix:
-            reasons.append(f"접두어 누락")
-        elif input_prefix != official_prefix:
-            reasons.append(
-                f"접두어 불일치 ({input_prefix}→{official_prefix})"
-            )
-
-        # 후미 노이즈
-        if normalized != original and normalized != self._remove_prefix(original):
-            # 정규화 과정에서 후미가 제거됨
-            pass  # 접두어 제거만 된 경우는 무시
-        suffix_in_original = re.search(r'\([^)]+\)$', self._remove_prefix(original))
-        if suffix_in_original:
-            suffix = suffix_in_original.group()
-            official_bare = self._remove_prefix(official)
-            if not official_bare.endswith(suffix):
-                reasons.append(f"불필요한 후미 {suffix}")
-
-        if not reasons:
-            reasons.append("접두어 누락")
-
-        return " + ".join(reasons) + f" → 공식: {official}"
-
 
 # ═══════════════════════════════════════════════════════════
 #  검토 엔진
 # ═══════════════════════════════════════════════════════════
 class ReviewEngine:
+    """파일 단위로 후보 명칭을 수집하고 판정 결과를 집계한다."""
 
     def __init__(self, matcher: NameMatcher):
+        """검토 엔진을 초기화한다.
+
+        Args:
+            matcher: 명칭 판정기 인스턴스.
+        """
         self.matcher = matcher
 
     @staticmethod
     def _build_full_text_with_offsets(text_items: list) -> tuple[str, list, list]:
+        """텍스트 조각 목록을 단일 문자열과 오프셋 테이블로 변환한다.
+
+        Args:
+            text_items: `(위치, 텍스트)` 목록.
+
+        Returns:
+            `(결합문자열, 시작오프셋목록, 오프셋메타목록)` 튜플.
+        """
         parts = []
         starts = []
         offsets = []
@@ -912,6 +1263,16 @@ class ReviewEngine:
 
     @staticmethod
     def _find_offset_index(starts: list, offsets: list, position: int) -> int:
+        """결합 문자열 위치를 원본 조각 인덱스로 역매핑한다.
+
+        Args:
+            starts: 각 조각 시작 오프셋 목록.
+            offsets: 조각 메타 목록.
+            position: 결합 문자열 내 문자 위치.
+
+        Returns:
+            대응 조각 인덱스. 없으면 `-1`.
+        """
         idx = bisect.bisect_right(starts, position) - 1
         if idx < 0 or idx >= len(offsets):
             return -1
@@ -920,11 +1281,42 @@ class ReviewEngine:
             return -1
         return idx
 
+    @staticmethod
+    def _extend_official_candidate(source_text: str, start: int, end: int) -> str:
+        """공식명칭 주변 부착 문자를 포함한 후보를 생성한다.
+
+        Args:
+            source_text: 원본 줄 텍스트.
+            start: 공식명칭 시작 인덱스(줄 기준).
+            end: 공식명칭 끝 인덱스(줄 기준, exclusive).
+
+        Returns:
+            경계 부착 여부를 판정할 수 있도록 확장된 후보 문자열.
+        """
+        left = start
+        right = end
+
+        # 경고 판정을 위해 공백이 아닌 좌/우 1글자를 함께 포함한다.
+        if left > 0 and not source_text[left - 1].isspace():
+            left -= 1
+        if right < len(source_text) and not source_text[right].isspace():
+            right += 1
+        return source_text[left:right].strip()
+
     def review_file(self, filepath: str) -> dict:
+        """단일 파일을 검토해 공사명칭 판정 결과를 반환한다.
+
+        Args:
+            filepath: 입력 파일 경로.
+
+        Returns:
+            파일 단위 집계 결과 dict.
+        """
         filename = os.path.basename(filepath)
         try:
             text_items = extract_text_from_file(filepath)
         except Exception as e:
+            # 파일 파싱 실패는 전체 검토 결과를 오류 상태로 반환한다.
             return {
                 "file": filename, "path": filepath,
                 "total": 0, "matched": 0, "mismatched": 0,
@@ -936,13 +1328,13 @@ class ReviewEngine:
         checked_locations = {}
 
         def consume_candidate(candidate: str, location: str):
+            """후보를 판정하고 중복 결과를 병합한다."""
             if candidate in checked_results:
                 existing = checked_results[candidate]
-                if existing["status"] == "불일치":
-                    locs = checked_locations[candidate]
-                    if location not in locs:
-                        locs.append(location)
-                        existing["location"] = ", ".join(locs)
+                locs = checked_locations[candidate]
+                if location not in locs:
+                    locs.append(location)
+                    existing["location"] = ", ".join(locs)
                 return
 
             check_result = self.matcher.check(candidate)
@@ -957,14 +1349,20 @@ class ReviewEngine:
         if full_text:
             match_events = []
             matched_offset_indices = set()
+
+            # 공식명칭 직접 매칭은 경고 판정을 위해 좌/우 부착 문자를 포함한다.
             for match in self.matcher._official_pattern.finditer(full_text):
                 idx = self._find_offset_index(starts, offsets, match.start())
                 if idx < 0:
                     continue
                 matched_offset_indices.add(idx)
-                location = offsets[idx][2]
-                match_events.append((match.start(), 0, match.group(0), location))
+                line_start, _, location, source_text = offsets[idx]
+                local_start = match.start() - line_start
+                local_end = local_start + len(match.group(0))
+                candidate = self._extend_official_candidate(source_text, local_start, local_end)
+                match_events.append((match.start(), 0, candidate, location))
 
+            # 순수명칭 매칭은 기존 방식 유지(접두어/유사도 단계로 연결).
             for match in self.matcher._bare_pattern.finditer(full_text):
                 idx = self._find_offset_index(starts, offsets, match.start())
                 if idx < 0:
@@ -981,7 +1379,7 @@ class ReviewEngine:
             for _, _, candidate, location in match_events:
                 consume_candidate(candidate, location)
 
-            # 정규식 미검출 조각에 대해서만 보조 탐색(유사도 포함) 수행
+            # 정규식 미검출 조각에 대해서만 보조 탐색(포함/유사도)을 수행한다.
             for idx, (_, _, location, source_text) in enumerate(offsets):
                 if idx in matched_offset_indices:
                     continue
@@ -992,11 +1390,12 @@ class ReviewEngine:
 
         matched = sum(1 for r in results if r["status"] == "일치")
         mismatched = sum(1 for r in results if r["status"] == "불일치")
+        warnings = sum(1 for r in results if r["status"] == "경고")
         total = len(results)
 
         if total == 0:
             overall = "명칭없음"
-        elif mismatched == 0:
+        elif mismatched == 0 and warnings == 0:
             overall = "적합"
         else:
             overall = "검토필요"
@@ -1014,13 +1413,22 @@ class ReviewEngine:
 # ═══════════════════════════════════════════════════════════
 def save_excel_report(all_results: list, output_path: str,
                       master_names: list):
+    """검토 결과를 Excel 리포트로 저장한다.
+
+    Args:
+        all_results: 파일별 검토 결과 목록.
+        output_path: 저장할 xlsx 경로.
+        master_names: 마스터 공식명칭 목록.
+    """
     from openpyxl import Workbook
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
+    # 헤더/본문 스타일 정의
     wb = Workbook()
     hdr_fill = PatternFill("solid", fgColor="2F5496")
     hdr_font = Font(color="FFFFFF", bold=True, size=11, name="맑은 고딕")
     ng_fill = PatternFill("solid", fgColor="FFC7CE")
+    warn_fill = PatternFill("solid", fgColor="FFF2CC")
     bdr = Border(left=Side('thin'), right=Side('thin'),
                  top=Side('thin'), bottom=Side('thin'))
     bfont = Font(size=10, name="맑은 고딕")
@@ -1072,8 +1480,11 @@ def save_excel_report(all_results: list, output_path: str,
             row += 1
             continue
 
-        # 불일치만 표시
-        ng_items = [d for d in fr["details"] if d["status"] == "불일치"]
+        # 불일치/경고만 표시(일치는 리포트에서 제외)
+        ng_items = [
+            d for d in fr["details"]
+            if d["status"] in ("불일치", "경고")
+        ]
 
         if not ng_items and not fr.get("error"):
             continue  # 적합한 파일은 건너뛰기
@@ -1084,7 +1495,13 @@ def save_excel_report(all_results: list, output_path: str,
                     value=d.get("location", "")).font = bfont
             c3 = ws.cell(row=row, column=3, value=d["input"])
             c3.font = bfont
-            c3.fill = ng_fill
+
+            # 경고는 노랑, 불일치는 빨강으로 강조한다.
+            if d["status"] == "경고":
+                c3.fill = warn_fill
+            else:
+                c3.fill = ng_fill
+
             ws.cell(row=row, column=4,
                     value=d.get("suggestion", "")).font = bfont
             ws.cell(row=row, column=5,
@@ -1106,9 +1523,7 @@ def save_excel_report(all_results: list, output_path: str,
         cell.border = bdr
 
     for i, name in enumerate(master_names, 1):
-        pm = re.match(r'^\(([^)]*)\)', name)
-        prefix = pm.group(1) if pm else ""
-        bare = re.sub(r'^\([^)]*\)', '', name).strip()
+        prefix, bare = split_official_name(name)
         ws2.cell(row=i + 1, column=1, value=i).font = bfont
         ws2.cell(row=i + 1, column=2, value=name).font = bfont
         ws2.cell(row=i + 1, column=3, value=prefix).font = bfont
