@@ -55,6 +55,11 @@ class App(ctk.CTk):
         self.geometry("1150x780")
         self.minsize(950, 650)
 
+        # 윈도우 아이콘 설정
+        self._icon_path = resource_path('app_icon.ico')
+        if os.path.exists(self._icon_path):
+            self.iconbitmap(self._icon_path)
+
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
 
@@ -100,13 +105,18 @@ class App(ctk.CTk):
             text_color="white"
         ).pack(side="left", padx=15, pady=12)
 
-        self.contact_label = ctk.CTkLabel(
+        self.help_btn = ctk.CTkButton(
             top,
-            text="DB갱신 및 문의처 : 전산파트 02-6984-9090",
-            font=ctk.CTkFont(size=11),
-            text_color="#aaaaaa"
+            text="도움말",
+            width=80,
+            height=30,
+            fg_color="#4472C4",
+            hover_color="#3A5FAE",
+            text_color="white",
+            font=ctk.CTkFont(size=12),
+            command=self._show_help,
         )
-        self.contact_label.pack(side="right", padx=15)
+        self.help_btn.pack(side="right", padx=15, pady=12)
 
         # 메인
         main = ctk.CTkFrame(self, fg_color="transparent")
@@ -242,13 +252,12 @@ class App(ctk.CTk):
         )
         self.sync_db_btn.pack(side="left", padx=(0, 8))
         self.db_source_label.pack(side="left", padx=(0, 0))
-
         self.status_label = ctk.CTkLabel(
             bottom,
             text="파일을 추가한 후 [검토 시작]을 눌러주세요.",
             font=ctk.CTkFont(size=11)
         )
-        self.status_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
+        self.status_label.pack(side="left", padx=(8, 0), fill="x", expand=True)
 
         self.report_btn = ctk.CTkButton(
             bottom, text="리포트 저장 (Excel)",
@@ -673,6 +682,43 @@ class App(ctk.CTk):
             0, lambda t=text: self.status_label.configure(text=t)
         )
 
+    def _apply_icon_to_toplevel(self, toplevel):
+        """Toplevel 윈도우에 앱 아이콘을 적용한다.
+
+        CustomTkinter의 CTkToplevel은 iconbitmap 상속이 불안정하므로
+        여러 방법을 순차적으로 시도한다.
+
+        Args:
+            toplevel: 아이콘을 적용할 CTkToplevel 인스턴스.
+        """
+        if not hasattr(self, '_icon_path') or not os.path.exists(self._icon_path):
+            return
+
+        icon_path = self._icon_path
+
+        def _try_set_icon():
+            try:
+                toplevel.iconbitmap(icon_path)
+            except Exception:
+                pass
+            try:
+                toplevel.wm_iconbitmap(icon_path)
+            except Exception:
+                pass
+            try:
+                from PIL import Image, ImageTk
+                icon_img = Image.open(icon_path)
+                icon_photo = ImageTk.PhotoImage(icon_img)
+                toplevel.iconphoto(False, icon_photo)
+                toplevel._icon_ref = icon_photo  # GC 방지
+            except Exception:
+                pass
+
+        # CTkToplevel 렌더링 완료 후 아이콘 적용을 시도한다.
+        toplevel.after(100, _try_set_icon)
+        toplevel.after(300, _try_set_icon)
+        toplevel.after(600, _try_set_icon)
+
     def _set_progress(self, value: float):
         self.after(0, lambda v=value: self.progress.set(v))
 
@@ -747,6 +793,92 @@ class App(ctk.CTk):
         if hasattr(self, "sync_db_btn"):
             self.sync_db_btn.configure(state="normal", text="DB동기")
 
+    def _show_help(self):
+        """사용설명서 팝업을 표시한다."""
+        popup = ctk.CTkToplevel(self)
+        popup.title("공사명칭 검토기 — 사용설명서")
+        popup.geometry("720x620")
+        popup.grab_set()
+        self._apply_icon_to_toplevel(popup)
+
+        textbox = ctk.CTkTextbox(
+            popup,
+            font=ctk.CTkFont(family="맑은 고딕", size=13),
+            wrap="word",
+        )
+        textbox.pack(fill="both", expand=True, padx=15, pady=15)
+
+        help_text = """\
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  공사명칭 검토기 사용설명서  (v1.0)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. 개요
+  보고서 파일(PDF, HWP, HWPX, XLSX, DOCX, CSV)에서
+  추출한 공사명칭을 마스터 DB와 비교하여
+  일치 / 불일치를 자동 판정하는 도구입니다.
+
+
+2. 파일 추가
+  • [파일 추가] : 개별 파일을 선택하여 추가합니다.
+  • [폴더 추가] : 폴더 내 지원 파일을 일괄 추가합니다.
+  • 드래그 앤 드롭 : 파일을 좌측 목록에 직접 끌어다 놓을 수 있습니다.
+  • [선택 삭제] / [전체 삭제] : 목록에서 파일을 제거합니다.
+
+
+3. 검토 실행
+  파일을 추가한 뒤 [검토 시작] 버튼을 클릭하면
+  각 파일에서 공사명칭을 추출하여 마스터 DB와 비교합니다.
+
+  결과는 우측 패널에 표시되며,
+  불일치 항목에는 사유와 공식 명칭 후보가 함께 안내됩니다.
+
+
+4. 스냅샷 보기 (PDF 전용)
+  검토 완료 후 [스냅샷 보기] 버튼을 클릭하면
+  불일치가 발견된 PDF 페이지를 하이라이트하여
+  이미지로 확인할 수 있습니다.
+
+  팝업에서 [전체 PNG 저장]으로 일괄 저장도 가능합니다.
+
+
+5. 리포트 저장
+  [리포트 저장 (Excel)] 버튼으로
+  검토 결과를 Excel 파일로 내보낼 수 있습니다.
+
+
+6. DB 동기화
+  좌측 하단 [DB동기] 버튼으로 서버의 최신 마스터 DB를
+  수동 동기화할 수 있습니다.
+  프로그램 시작 시에도 자동으로 서버 동기화를 시도합니다.
+  동기화 실패 시 내장 DB로 검토가 진행됩니다.
+
+
+7. 지원 파일 형식
+  HWP, HWPX, PDF, XLSX, DOCX, CSV
+
+
+8. 판정 기준
+  • 일치 : 마스터 DB에 동일 명칭이 존재
+  • 경고 : 접두어 차이 또는 유사명칭 감지 (유사도 기반)
+  • 불일치 : 마스터 DB에 해당 명칭 없음
+
+
+9. 문의처(DB 갱신 및 오류)
+  • 전산파트 02-6984-9090
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+
+        textbox.insert("1.0", help_text)
+        textbox.configure(state="disabled")
+
+        ctk.CTkButton(
+            popup,
+            text="닫기",
+            width=100,
+            height=34,
+            command=popup.destroy,
+        ).pack(pady=(0, 15))
+
     def _show_snapshots(self):
         """불일치가 있는 PDF 페이지를 하이라이트 스냅샷으로 팝업 표시한다."""
         if self.is_reviewing:
@@ -793,6 +925,7 @@ class App(ctk.CTk):
         popup.title("불일치 스냅샷 보기")
         popup.geometry("900x700")
         popup.grab_set()
+        self._apply_icon_to_toplevel(popup)
 
         info_frame = ctk.CTkFrame(popup, fg_color="transparent")
         info_frame.pack(fill="x", padx=10, pady=(10, 5))
