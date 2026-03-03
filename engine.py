@@ -18,6 +18,8 @@
 import os
 import re
 import bisect
+import queue
+import threading
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Optional
@@ -147,46 +149,180 @@ def _merge_pdf_prefix_fragments(texts: list) -> list:
     return merged
 
 
+def _extract_pages_pdfplumber(
+    filepath: str,
+    total_pages: int,
+    timeout_per_page: float = 2.0,
+) -> dict[int, Optional[list[tuple[str, str]]]]:
+    """pdfplumber로 전체 페이지를 추출한다. PDF는 한 번만 연다.
+
+    각 페이지 추출에 개별 타임아웃을 적용하며, 타임아웃 또는 오류 발생 시
+    해당 페이지는 ``None``으로 기록하여 호출측에서 폴백 처리하도록 한다.
+
+    Args:
+        filepath: PDF 파일 경로.
+        total_pages: 전체 페이지 수.
+        timeout_per_page: 페이지당 추출 타임아웃(초).
+
+    Returns:
+        ``{페이지번호: [(위치, 텍스트), ...] 또는 None}`` 딕셔너리.
+    """
+    import pdfplumber
+
+    results: dict[int, Optional[list[tuple[str, str]]]] = {}
+
+    try:
+        pdf = pdfplumber.open(filepath)
+    except Exception:
+        # pdfplumber로 PDF를 열 수 없으면 전 페이지 None 반환
+        return {pg: None for pg in range(1, total_pages + 1)}
+
+    try:
+        for page_num in range(1, total_pages + 1):
+            if page_num > len(pdf.pages):
+                results[page_num] = []
+                continue
+
+            page = pdf.pages[page_num - 1]
+
+            # 페이지별 타임아웃 처리
+            result_queue: "queue.Queue[tuple[str, object]]" = queue.Queue(maxsize=1)
+
+            def _worker(p=page, pn=page_num):
+                try:
+                    page_text = p.extract_text() or ""
+                    page_texts: list[tuple[str, str]] = []
+                    for line_num, line in enumerate(page_text.split('\n'), 1):
+                        line = line.strip()
+                        if line:
+                            page_texts.append((f"P{pn} L{line_num}", line))
+                    result_queue.put(("ok", page_texts))
+                except Exception:
+                    result_queue.put(("error", None))
+
+            worker = threading.Thread(target=_worker, daemon=True)
+            worker.start()
+            worker.join(timeout_per_page)
+
+            if worker.is_alive():
+                # 타임아웃 — 이 페이지는 폴백 대상
+                results[page_num] = None
+                continue
+
+            if result_queue.empty():
+                results[page_num] = None
+                continue
+
+            status, payload = result_queue.get_nowait()
+            if status == "ok" and payload is not None:
+                results[page_num] = payload  # type: ignore[assignment]
+            else:
+                results[page_num] = None
+    finally:
+        try:
+            pdf.close()
+        except Exception:
+            pass
+
+    return results
+
+
+def _extract_pages_pymupdf(
+    filepath: str,
+    page_nums: list[int],
+) -> dict[int, list[tuple[str, str]]]:
+    """PyMuPDF로 지정 페이지들의 텍스트를 추출한다. PDF는 한 번만 연다.
+
+    Args:
+        filepath: PDF 파일 경로.
+        page_nums: 1-based 페이지 번호 목록.
+
+    Returns:
+        ``{페이지번호: [(위치, 텍스트), ...]}`` 딕셔너리.
+    """
+    results: dict[int, list[tuple[str, str]]] = {}
+    if not page_nums:
+        return results
+
+    try:
+        import fitz
+    except ImportError:
+        return results
+
+    try:
+        doc = fitz.open(filepath)
+        try:
+            for page_num in page_nums:
+                if page_num - 1 >= len(doc):
+                    results[page_num] = []
+                    continue
+                page = doc[page_num - 1]
+                page_text = page.get_text()
+                lines: list[tuple[str, str]] = []
+                if page_text:
+                    for line_num, line in enumerate(page_text.split('\n'), 1):
+                        line = line.strip()
+                        if line:
+                            lines.append((f"P{page_num} L{line_num}", line))
+                results[page_num] = lines
+        finally:
+            doc.close()
+    except Exception:
+        pass
+
+    return results
+
+
 def extract_from_pdf(filepath: str) -> list:
     """PDF 파일에서 줄 단위 텍스트를 추출한다.
 
+    pdfplumber로 전체 페이지를 추출하고(PDF 1회 오픈, 페이지당 타임아웃 2초),
+    실패 페이지만 PyMuPDF로 폴백한다(PDF 1회 오픈).
+    최종 결과에 조각 병합 후처리를 적용한다.
+
     Args:
-        filepath: `.pdf` 파일 경로.
+        filepath: ``.pdf`` 파일 경로.
 
     Returns:
-        `(위치, 텍스트)` 튜플 목록.
+        ``(위치, 텍스트)`` 튜플 목록.
     """
-    texts = []
-
+    # ── 페이지 수 확인 ──
+    total_pages = 0
     try:
-        import fitz  # PyMuPDF
-
+        import fitz
         doc = fitz.open(filepath)
-        try:
-            for page_num, page in enumerate(doc, 1):
-                page_text = page.get_text()
-                if not page_text:
-                    continue
-                for line_num, line in enumerate(page_text.split('\n'), 1):
-                    line = line.strip()
-                    if line:
-                        texts.append((f"P{page_num} L{line_num}", line))
-        finally:
-            doc.close()
-        return _merge_pdf_prefix_fragments(texts)
+        total_pages = len(doc)
+        doc.close()
     except ImportError:
-        pass
+        import pdfplumber
+        with pdfplumber.open(filepath) as pdf:
+            total_pages = len(pdf.pages)
 
-    import pdfplumber
-    with pdfplumber.open(filepath) as pdf:
-        for page_num, page in enumerate(pdf.pages, 1):
-            page_text = page.extract_text()
-            if not page_text:
-                continue
-            for line_num, line in enumerate(page_text.split('\n'), 1):
-                line = line.strip()
-                if line:
-                    texts.append((f"P{page_num} L{line_num}", line))
+    if total_pages == 0:
+        return []
+
+    # ── 1단계: pdfplumber 전체 추출 (PDF 1회 오픈) ──
+    plumber_results = _extract_pages_pdfplumber(
+        filepath, total_pages, timeout_per_page=2.0
+    )
+
+    # ── 2단계: 실패 페이지 수집 → PyMuPDF 일괄 폴백 (PDF 1회 오픈) ──
+    failed_pages = [
+        pg for pg in range(1, total_pages + 1)
+        if plumber_results.get(pg) is None
+    ]
+    pymupdf_results = _extract_pages_pymupdf(filepath, failed_pages)
+
+    # ── 3단계: 결과 조립 ──
+    texts: list[tuple[str, str]] = []
+    for pg in range(1, total_pages + 1):
+        page_data = plumber_results.get(pg)
+        if page_data is not None:
+            texts.extend(page_data)
+        else:
+            fallback = pymupdf_results.get(pg, [])
+            texts.extend(fallback)
+
     return _merge_pdf_prefix_fragments(texts)
 
 
