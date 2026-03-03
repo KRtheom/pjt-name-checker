@@ -73,6 +73,80 @@ def extract_from_xlsx(filepath: str) -> list:
     return texts
 
 
+def _merge_pdf_prefix_fragments(texts: list) -> list:
+    """PDF 추출 결과에서 분리된 접두어 조각을 병합한다.
+
+    PyMuPDF가 표 셀 내부 텍스트를 라인 단위로 분할할 때
+    ``(접두어)명칭`` 이 ``접두어텍스트`` + ``(`` + ``)명칭`` 으로
+    3조각 나는 경우를 감지하여 ``(접두어)명칭`` 으로 복원한다.
+
+    Args:
+        texts: ``(위치, 텍스트)`` 튜플 목록 (extract_from_pdf 원본 결과).
+
+    Returns:
+        병합 처리된 ``(위치, 텍스트)`` 튜플 목록.
+    """
+    if len(texts) < 3:
+        return texts
+
+    # 병합 대상으로 소비된 인덱스를 기록한다.
+    consumed: set[int] = set()
+    merged: list[tuple[str, str]] = []
+
+    i = 0
+    while i < len(texts):
+        if i in consumed:
+            i += 1
+            continue
+
+        loc_cur, txt_cur = texts[i]
+
+        # 패턴 감지: 현재 라인이 ")" + 한글/영문/숫자로 시작하는 경우
+        if (
+            len(txt_cur) >= 2
+            and txt_cur[0] == ')'
+            and i >= 2
+        ):
+            _, txt_prev1 = texts[i - 1]  # 바로 직전 라인
+            _, txt_prev2 = texts[i - 2]  # 2칸 위 라인
+
+            # 직전 라인이 "(" 이고, 2칸 위 라인 끝에 접두어 텍스트가 있는 경우
+            if txt_prev1.strip() == '(':
+                # 2칸 위 라인에서 접두어 추출: ": 종심", "- 대상\n: 종심" 등
+                # 콜론 뒤의 마지막 토큰을 접두어로 간주
+                prefix_text = ""
+                colon_match = re.search(r'[:：]\s*(\S+)\s*$', txt_prev2)
+                if colon_match:
+                    candidate = colon_match.group(1).strip()
+                    # KNOWN_PREFIXES에 포함되는지 확인
+                    if candidate in KNOWN_PREFIXES:
+                        prefix_text = candidate
+
+                if prefix_text:
+                    # 순수명칭: ")" 제거한 나머지
+                    bare_name = txt_cur[1:].strip()
+                    restored = f"({prefix_text}){bare_name}"
+
+                    # 2칸 위 라인에서 접두어 부분을 제거한 텍스트 복원
+                    cleaned_prev2 = txt_prev2[:colon_match.start(1)].rstrip()
+                    if cleaned_prev2 and cleaned_prev2 != texts[i - 2][1]:
+                        # 접두어만 제거된 앞부분이 남으면 유지
+                        merged.append((texts[i - 2][0], cleaned_prev2))
+                    consumed.add(i - 2)
+                    consumed.add(i - 1)  # "(" 라인 소비
+                    merged.append((loc_cur, restored))
+                    i += 1
+                    continue
+
+        if i not in consumed:
+            merged.append((loc_cur, txt_cur))
+        i += 1
+
+    # consumed에 포함되었지만 merged에서 대체되지 않은 항목 제거
+    # (이미 위 로직에서 처리되므로 추가 작업 불필요)
+    return merged
+
+
 def extract_from_pdf(filepath: str) -> list:
     """PDF 파일에서 줄 단위 텍스트를 추출한다.
 
@@ -99,7 +173,7 @@ def extract_from_pdf(filepath: str) -> list:
                         texts.append((f"P{page_num} L{line_num}", line))
         finally:
             doc.close()
-        return texts
+        return _merge_pdf_prefix_fragments(texts)
     except ImportError:
         pass
 
@@ -113,7 +187,7 @@ def extract_from_pdf(filepath: str) -> list:
                 line = line.strip()
                 if line:
                     texts.append((f"P{page_num} L{line_num}", line))
-    return texts
+    return _merge_pdf_prefix_fragments(texts)
 
 
 def extract_from_docx(filepath: str) -> list:
