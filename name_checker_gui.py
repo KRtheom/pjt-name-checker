@@ -6,6 +6,7 @@ import os
 import queue
 import sys
 import threading
+import io
 from datetime import datetime
 from time import perf_counter
 
@@ -13,9 +14,10 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
 try:
-    from PIL import Image
+    from PIL import Image, ImageTk
 except ImportError:
     Image = None
+    ImageTk = None
 
 try:
     import windnd
@@ -24,6 +26,7 @@ except ImportError:
 
 from engine import (
     SUPPORTED_EXTENSIONS,
+    generate_highlight_snapshots,
     get_last_master_load_error,
     load_master_names,
     NameMatcher,
@@ -255,6 +258,15 @@ class App(ctk.CTk):
             command=self._save_report
         )
         self.report_btn.pack(side="right", padx=(8, 0))
+
+        self.snapshot_btn = ctk.CTkButton(
+            bottom, text="스냅샷 보기",
+            width=130, height=38,
+            fg_color="#17A2B8", hover_color="#138496",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._show_snapshots
+        )
+        self.snapshot_btn.pack(side="right", padx=(8, 0))
 
         self.review_btn = ctk.CTkButton(
             bottom, text="검토 시작",
@@ -734,6 +746,118 @@ class App(ctk.CTk):
         self.is_syncing = False
         if hasattr(self, "sync_db_btn"):
             self.sync_db_btn.configure(state="normal", text="DB동기")
+
+    def _show_snapshots(self):
+        """불일치가 있는 PDF 페이지를 하이라이트 스냅샷으로 팝업 표시한다."""
+        if self.is_reviewing:
+            return
+        if not self.all_results:
+            messagebox.showwarning(
+                "스냅샷", "검토 결과가 없습니다.\n먼저 검토를 실행해주세요."
+            )
+            return
+
+        if Image is None:
+            messagebox.showwarning(
+                "스냅샷", "Pillow가 설치되지 않아 스냅샷을 표시할 수 없습니다."
+            )
+            return
+
+        # PDF 파일별 불일치 항목을 수집해 페이지 스냅샷을 생성한다.
+        pdf_snapshots: list[tuple[str, int, bytes]] = []
+        for result in self.all_results:
+            filepath = result.get("path", "")
+            if not filepath or not filepath.lower().endswith(".pdf"):
+                continue
+
+            ng_items = [
+                d for d in result.get("details", [])
+                if d["status"] == "불일치"
+            ]
+            if not ng_items:
+                continue
+
+            snapshots = generate_highlight_snapshots(filepath, ng_items)
+            fname = os.path.basename(filepath)
+            for page_num, png_bytes in snapshots:
+                pdf_snapshots.append((fname, page_num, png_bytes))
+
+        if not pdf_snapshots:
+            messagebox.showinfo(
+                "스냅샷",
+                "표시할 PDF 스냅샷이 없습니다.\n(PDF 파일에 불일치가 없거나, PDF가 아닌 파일만 검토됨)"
+            )
+            return
+
+        popup = ctk.CTkToplevel(self)
+        popup.title("불일치 스냅샷 보기")
+        popup.geometry("900x700")
+        popup.grab_set()
+
+        info_frame = ctk.CTkFrame(popup, fg_color="transparent")
+        info_frame.pack(fill="x", padx=10, pady=(10, 5))
+
+        ctk.CTkLabel(
+            info_frame,
+            text=f"불일치 페이지 {len(pdf_snapshots)}개",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).pack(side="left")
+
+        def _save_all_snapshots():
+            """현재 팝업의 스냅샷을 PNG로 일괄 저장한다."""
+            folder = filedialog.askdirectory(title="스냅샷 저장 폴더 선택")
+            if not folder:
+                return
+
+            saved = 0
+            for fname, page_num, png_bytes in pdf_snapshots:
+                base = os.path.splitext(fname)[0]
+                out_path = os.path.join(folder, f"검토_{base}_P{page_num}.png")
+                with open(out_path, "wb") as f:
+                    f.write(png_bytes)
+                saved += 1
+            messagebox.showinfo("저장 완료", f"{saved}개 스냅샷 저장됨\n{folder}")
+
+        ctk.CTkButton(
+            info_frame, text="전체 PNG 저장",
+            width=130, height=32,
+            fg_color="#28A745", hover_color="#218838",
+            command=_save_all_snapshots
+        ).pack(side="right")
+
+        scroll_frame = ctk.CTkScrollableFrame(popup)
+        scroll_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        # 이미지 객체 참조를 유지해 가비지 컬렉션으로 사라지지 않게 한다.
+        popup._snapshot_images = []
+
+        for fname, page_num, png_bytes in pdf_snapshots:
+            ctk.CTkLabel(
+                scroll_frame,
+                text=f"📄 {fname} — P{page_num}",
+                font=ctk.CTkFont(size=13, weight="bold")
+            ).pack(pady=(12, 4), anchor="w")
+
+            pil_image = Image.open(io.BytesIO(png_bytes))
+            max_width = 860
+            if pil_image.width > max_width:
+                ratio = max_width / pil_image.width
+                new_size = (max_width, int(pil_image.height * ratio))
+                pil_image = pil_image.resize(new_size, Image.LANCZOS)
+
+            ctk_image = ctk.CTkImage(
+                light_image=pil_image,
+                dark_image=pil_image,
+                size=(pil_image.width, pil_image.height)
+            )
+            popup._snapshot_images.append(ctk_image)
+
+            img_label = ctk.CTkLabel(
+                scroll_frame,
+                image=ctk_image,
+                text=""
+            )
+            img_label.pack(pady=(0, 8))
 
     def _save_report(self):
         if self.is_reviewing:

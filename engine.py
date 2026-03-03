@@ -1775,3 +1775,94 @@ def save_excel_report(all_results: list, output_path: str,
         ws2.column_dimensions[letter].width = w
 
     wb.save(output_path)
+
+
+def generate_highlight_snapshots(
+    filepath: str,
+    ng_items: list[dict],
+    scale: float = 2.0,
+) -> list[tuple[int, bytes]]:
+    """PDF 파일에서 불일치 위치를 하이라이트한 페이지 이미지를 생성한다.
+
+    Args:
+        filepath: PDF 파일 경로.
+        ng_items: 불일치 항목 목록(`{"input": str, "location": str, ...}`).
+        scale: 이미지 렌더링 배율(기본 2배).
+
+    Returns:
+        ``(페이지번호, PNG바이트)`` 튜플 목록. 생성 실패 시 빈 목록.
+    """
+    try:
+        import fitz
+    except ImportError:
+        return []
+
+    if os.path.splitext(filepath)[1].lower() != ".pdf":
+        return []
+
+    # 페이지별 검색어를 묶어 페이지 렌더링을 최소화한다.
+    page_targets: dict[int, list[str]] = {}
+    for item in ng_items:
+        location = item.get("location", "")
+        m = re.match(r'P(\d+)', location)
+        if not m:
+            continue
+        page_num = int(m.group(1))
+
+        # 검색어는 앞쪽 특수기호를 제거해 검색 성공률을 높인다.
+        search_text = item.get("input", "").strip()
+        search_text = search_text.lstrip(STRIP_CHARS).strip()
+        if not search_text or len(search_text) < 2:
+            continue
+        page_targets.setdefault(page_num, []).append(search_text)
+
+    if not page_targets:
+        return []
+
+    results: list[tuple[int, bytes]] = []
+    try:
+        doc = fitz.open(filepath)
+        try:
+            mat = fitz.Matrix(scale, scale)
+            for page_num in sorted(page_targets.keys()):
+                if page_num - 1 >= len(doc):
+                    continue
+                page = doc[page_num - 1]
+                targets = page_targets[page_num]
+
+                for search_text in targets:
+                    # 1차: 원문 문자열 검색
+                    rects = page.search_for(search_text)
+
+                    # 2차: 접두어 제거 순수명칭 검색
+                    if not rects:
+                        _, bare = split_official_name(search_text)
+                        if bare and bare != search_text:
+                            rects = page.search_for(bare)
+
+                    # 3차: 앞 4글자 검색
+                    if not rects and len(search_text) >= 4:
+                        rects = page.search_for(search_text[:4])
+
+                    for rect in rects:
+                        expanded = fitz.Rect(
+                            rect.x0 - 2, rect.y0 - 2,
+                            rect.x1 + 20, rect.y1 + 2
+                        )
+                        # 가시성을 위해 빨간 테두리 + 노란 하이라이트를 함께 표시한다.
+                        annot = page.add_rect_annot(expanded)
+                        annot.set_colors(stroke=(1, 0, 0))
+                        annot.set_border(width=2)
+                        annot.update()
+
+                        highlight = page.add_highlight_annot(expanded)
+                        highlight.update()
+
+                pix = page.get_pixmap(matrix=mat)
+                results.append((page_num, pix.tobytes("png")))
+        finally:
+            doc.close()
+    except Exception:
+        pass
+
+    return results
