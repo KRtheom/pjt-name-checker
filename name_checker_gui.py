@@ -77,6 +77,8 @@ class App(ctk.CTk):
         self._sync_queue = queue.Queue()
 
         self._build_ui()
+        self._pending_progress = 0.0
+        self.bind("<<UpdateProgress>>", self._on_update_progress)
         self._poll_drop_queue()
         self._poll_sync_queue()
 
@@ -566,10 +568,80 @@ class App(ctk.CTk):
                 f"  검토 시작  |  {total}개 파일  |  {now}"
             )
             self._log("=" * 58)
+            self._set_progress(0.0)
 
             grand_total = 0
             grand_match = 0
+            grand_warning = 0
             grand_mismatch = 0
+
+            def _parse_issue_and_official(
+                issue: str, suggestion: str, is_warning: bool
+            ) -> tuple[str, str]:
+                """이슈 문구에서 사유와 공식명칭을 분리한다."""
+                reason = (issue or "").strip()
+                official = (suggestion or "").strip()
+
+                if "특정불가" in reason:
+                    lines = [line.strip() for line in reason.split("\n") if line.strip()]
+                    if lines:
+                        reason = lines[0]
+                    if len(lines) > 1 and not official:
+                        official = " / ".join(lines[1:])
+                elif "→" in reason:
+                    tail = ""
+                    if " → " in reason:
+                        reason, tail = reason.rsplit(" → ", 1)
+                    else:
+                        parts = [p.strip() for p in reason.split("→") if p.strip()]
+                        if len(parts) > 1:
+                            reason = "→".join(parts[:-1]).strip()
+                            tail = parts[-1]
+                        elif parts:
+                            reason = parts[0]
+                    tail = tail.strip()
+                    if tail.startswith("공식:"):
+                        official = tail[3:].strip()
+                    elif tail.startswith("후보:"):
+                        official = tail[3:].strip()
+                    elif tail:
+                        official = tail
+
+                # 경고 섹션에서는 "경고:" 접두어를 제거해 중복 표시를 피한다.
+                if is_warning and reason.startswith("경고:"):
+                    reason = reason[len("경고:"):].strip()
+
+                if not reason:
+                    reason = "경고" if is_warning else "불일치"
+                return reason, official
+
+            def _log_section(title: str, items: list[dict], is_warning: bool):
+                """검토 항목을 박스 스타일 섹션으로 출력한다."""
+                if not items:
+                    return
+
+                bar = "─" * 50
+                self._log("")
+                self._log(f"  ■ {title} ({len(items)}건)")
+                self._log(f"  ┌{bar}")
+
+                for i, item in enumerate(items):
+                    self._log(f"  │ {item.get('input', '')}")
+                    location = item.get("location", "")
+                    if location:
+                        self._log(f"  │   위치: {location}")
+
+                    reason, official = _parse_issue_and_official(
+                        item.get("issue", ""),
+                        item.get("suggestion", ""),
+                        is_warning,
+                    )
+                    self._log(f"  │   사유: {reason}")
+                    if official:
+                        self._log(f"  │   공식: {official}")
+
+                    connector = "└" if i == len(items) - 1 else "├"
+                    self._log(f"  {connector}{bar}")
 
             for idx, fpath in enumerate(files):
                 fname = os.path.basename(fpath)
@@ -577,91 +649,57 @@ class App(ctk.CTk):
                     f"검토 중... ({idx+1}/{total}) {fname}"
                 )
 
-                result = self.engine.review_file(fpath)
+                cb = lambda v, idx=idx: self._update_file_progress(idx, total, v)
+                result = self.engine.review_file(fpath, progress_callback=cb)
                 self.all_results.append(result)
 
-                grand_total += result["total"]
-                grand_match += result["matched"]
-                grand_mismatch += result["mismatched"]
+                warning_count = int(result.get("warning", 0) or 0)
+                if warning_count == 0 and result.get("details"):
+                    warning_count = sum(
+                        1 for d in result["details"]
+                        if d.get("status") not in {"일치", "불일치"}
+                    )
+
+                grand_total += int(result.get("total", 0) or 0)
+                grand_match += int(result.get("matched", 0) or 0)
+                grand_warning += warning_count
+                grand_mismatch += int(result.get("mismatched", 0) or 0)
 
                 if result.get("error"):
                     self._log(f"\n[{idx+1}] {fname}  →  오류")
                     self._log(f"     {result['error']}")
-                    continue
-
-                # 불일치 항목만 추출
-                ng_items = [
-                    d for d in result["details"]
-                    if d["status"] == "불일치"
-                ]
-
-                if not ng_items:
-                    # 적합한 파일은 간단히 한 줄만
-                    self._log(
-                        f"\n[{idx+1}] {fname}  →  "
-                        f"적합 (일치 {result['matched']}개)"
-                    )
                 else:
-                    sep = "─" * 53
-                    self._log(f"\n{sep}")
-                    self._log(f"[{idx+1}] {fname}  →  불일치 {len(ng_items)}건 발견")
-                    self._log(sep)
+                    warn_items = [
+                        d for d in result.get("details", [])
+                        if d.get("status") == "경고"
+                    ]
+                    ng_items = [
+                        d for d in result.get("details", [])
+                        if d.get("status") == "불일치"
+                    ]
 
-                    for d in ng_items:
-                        location = d.get("location", "")
-                        if location:
-                            self._log(f" NG | {d['input']}  | 위치: {location}")
-                        else:
-                            self._log(f" NG | {d['input']}")
+                    if not warn_items and not ng_items:
+                        self._log(
+                            f"\n[{idx+1}] {fname}  →  "
+                            f"적합 (일치 {result.get('matched', 0)}개)"
+                        )
+                    else:
+                        sep = "─" * 53
+                        self._log(f"\n{sep}")
+                        self._log(
+                            f"[{idx+1}] {fname}  →  "
+                            f"경고 {len(warn_items)}건 | 불일치 {len(ng_items)}건"
+                        )
+                        self._log(sep)
 
-                        issue = d.get("issue", "")
-                        suggestion = d.get("suggestion", "")
+                        # 가독성을 위해 불일치를 먼저, 경고를 뒤에 출력한다.
+                        _log_section("불일치", ng_items, is_warning=False)
+                        _log_section("경고", warn_items, is_warning=True)
 
-                        if "특정불가" in issue:
-                            lines = issue.split("\n")
-                            self._log(f"    | 사유: {lines[0]}")
-                            if len(lines) > 1:
-                                self._log("    | 후보:")
-                                for sub_line in lines[1:]:
-                                    sub_line = sub_line.strip()
-                                    if sub_line:
-                                        self._log(f"    |   {sub_line}")
-                        elif "→" in issue:
-                            reason = issue
-                            tail = ""
-                            if " → " in issue:
-                                reason, tail = issue.rsplit(" → ", 1)
-                            else:
-                                parts = [p.strip() for p in issue.split("→") if p.strip()]
-                                if len(parts) > 1:
-                                    reason = "→".join(parts[:-1]).strip()
-                                    tail = parts[-1]
-                                elif parts:
-                                    reason = parts[0]
+                        self._log(sep)
 
-                            self._log(f"    | 사유: {reason}")
-
-                            if tail.startswith("공식:"):
-                                self._log(f"    | 공식: {tail[3:].strip()}")
-                            elif tail.startswith("후보:"):
-                                self._log(f"    | 후보: {tail[3:].strip()}")
-                            elif tail:
-                                self._log(f"    | 공식: {tail}")
-                            elif suggestion:
-                                self._log(f"    | 공식: {suggestion}")
-                        else:
-                            if issue:
-                                self._log(f"    | 사유: {issue}")
-                            elif suggestion:
-                                self._log("    | 사유: 불일치")
-                            if suggestion:
-                                self._log(f"    | 공식: {suggestion}")
-
-                        self._log("    |")
-
-                    self._log(sep)
-
-                self._set_progress((idx + 1) / total)
+                # 파일 단위 완료 시 즉시 진행률을 반영한다.
+                self._set_progress((idx + 1) / total if total else 0.0)
 
             # 요약
             elapsed = perf_counter() - started_at
@@ -670,12 +708,14 @@ class App(ctk.CTk):
             self._log(
                 f"  발견 {grand_total}개  |  "
                 f"일치 {grand_match}개  |  "
+                f"경고 {grand_warning}개  |  "
                 f"불일치 {grand_mismatch}개"
             )
             self._log("=" * 58)
 
             self._set_status(
                 f"검토 완료  |  발견 {grand_total}개 : "
+                f"일치 {grand_match}개 | 경고 {grand_warning}개 | "
                 f"불일치 {grand_mismatch}개  |  {elapsed:.1f}s"
             )
 
@@ -739,6 +779,33 @@ class App(ctk.CTk):
 
     def _set_progress(self, value: float):
         self.after(0, lambda v=value: self.progress.set(v))
+
+    def _update_file_progress(self, file_idx: int, total_files: int, value: float):
+        """파일 내부 진행률을 전체 진행률로 환산하여 프로그레스바를 갱신한다.
+
+        Args:
+            file_idx: 현재 처리 중인 파일 인덱스(0-based).
+            total_files: 전체 파일 수.
+            value: 현재 파일 내부 진행률(0.0~1.0).
+        """
+        if total_files <= 0:
+            return
+
+        # 엔진 콜백 값의 범위를 보정해 UI 진행률 오차를 방지한다.
+        clamped = max(0.0, min(1.0, float(value)))
+        overall = (file_idx + clamped) / total_files
+        self._pending_progress = overall
+        try:
+            self.event_generate("<<UpdateProgress>>", when="tail")
+        except Exception:
+            pass
+
+    def _on_update_progress(self, event=None):
+        """메인 스레드에서 프로그레스바를 갱신한다."""
+        try:
+            self.progress.set(self._pending_progress)
+        except Exception:
+            pass
 
     # ── 리포트 ──
     def _sync_db(self):

@@ -303,7 +303,7 @@ def _extract_pages_pymupdf(
     return results
 
 
-def extract_from_pdf(filepath: str) -> list:
+def extract_from_pdf(filepath: str, progress_callback=None) -> list:
     """PDF 파일에서 줄 단위 텍스트를 추출한다.
 
     pdfplumber로 전체 페이지를 추출하고(PDF 1회 오픈, 페이지당 타임아웃 2초),
@@ -312,10 +312,21 @@ def extract_from_pdf(filepath: str) -> list:
 
     Args:
         filepath: ``.pdf`` 파일 경로.
+        progress_callback: PDF 추출 단계 진행률 콜백(0.0~0.3 구간).
 
     Returns:
         ``(위치, 텍스트)`` 튜플 목록.
     """
+    def _emit_progress(value: float):
+        """PDF 추출 진행률 콜백을 안전하게 호출한다."""
+        if progress_callback is None:
+            return
+        try:
+            clamped = max(0.0, min(0.3, float(value)))
+            progress_callback(clamped)
+        except Exception:
+            pass
+
     # ── 페이지 수 확인 ──
     total_pages = 0
     try:
@@ -335,6 +346,7 @@ def extract_from_pdf(filepath: str) -> list:
     plumber_results = _extract_pages_pdfplumber(
         filepath, total_pages, timeout_per_page=2.0
     )
+    _emit_progress(0.15)
 
     # ── 2단계: 실패 페이지 수집 → PyMuPDF 일괄 폴백 (PDF 1회 오픈) ──
     failed_pages = [
@@ -342,6 +354,7 @@ def extract_from_pdf(filepath: str) -> list:
         if plumber_results.get(pg) is None
     ]
     pymupdf_results = _extract_pages_pymupdf(filepath, failed_pages)
+    _emit_progress(0.25)
 
     # ── 3단계: 결과 조립 ──
     texts: list[tuple[str, str]] = []
@@ -352,6 +365,10 @@ def extract_from_pdf(filepath: str) -> list:
         else:
             fallback = pymupdf_results.get(pg, [])
             texts.extend(fallback)
+        # 페이지 조립 진행률은 0.25~0.30 구간으로 반영한다.
+        _emit_progress(0.25 + 0.05 * (pg / total_pages))
+
+    _emit_progress(0.3)
 
     return _merge_pdf_prefix_fragments(texts)
 
@@ -573,12 +590,17 @@ def extract_from_csv(filepath: str) -> list:
     raise ValueError(f"CSV 인코딩 인식 불가: {filepath}")
 
 
-def extract_text_from_file(filepath: str, include_pdf_tables: bool = False) -> list:
+def extract_text_from_file(
+    filepath: str,
+    include_pdf_tables: bool = False,
+    progress_callback=None,
+) -> list:
     """파일 확장자에 따라 적절한 텍스트 추출기를 호출한다.
 
     Args:
         filepath: 입력 파일 경로.
         include_pdf_tables: 호환용 인자(현재 미사용).
+        progress_callback: 텍스트 추출 단계 진행률 콜백.
 
     Returns:
         `(위치, 텍스트)` 튜플 목록.
@@ -587,7 +609,7 @@ def extract_text_from_file(filepath: str, include_pdf_tables: bool = False) -> l
     _ = include_pdf_tables
     ext = os.path.splitext(filepath)[1].lower()
     if ext == ".pdf":
-        return extract_from_pdf(filepath)
+        return extract_from_pdf(filepath, progress_callback=progress_callback)
 
     dispatch = {
         ".xlsx": extract_from_xlsx,
@@ -1543,23 +1565,39 @@ class ReviewEngine:
             right += 1
         return source_text[left:right].strip()
 
-    def review_file(self, filepath: str) -> dict:
+    def review_file(self, filepath: str, progress_callback=None) -> dict:
         """단일 파일을 검토해 공사명칭 판정 결과를 반환한다.
 
         Args:
             filepath: 입력 파일 경로.
+            progress_callback: 파일 내부 진행률(0.0~1.0) 콜백.
 
         Returns:
             파일 단위 집계 결과 dict.
         """
+        def _emit_progress(value: float):
+            """진행률 콜백을 안전하게 호출한다."""
+            if progress_callback is None:
+                return
+            try:
+                clamped = max(0.0, min(1.0, float(value)))
+                progress_callback(clamped)
+            except Exception:
+                pass
+
         filename = os.path.basename(filepath)
         try:
-            text_items = extract_text_from_file(filepath)
+            text_items = extract_text_from_file(
+                filepath,
+                progress_callback=progress_callback,
+            )
+            _emit_progress(0.3)
         except Exception as e:
+            _emit_progress(1.0)
             # 파일 파싱 실패는 전체 검토 결과를 오류 상태로 반환한다.
             return {
                 "file": filename, "path": filepath,
-                "total": 0, "matched": 0, "mismatched": 0,
+                "total": 0, "matched": 0, "mismatched": 0, "warning": 0,
                 "overall": "오류", "details": [], "error": str(e)
             }
 
@@ -1618,13 +1656,25 @@ class ReviewEngine:
                 candidate = prefixed if prefixed else bare
                 match_events.append((match.start(), 1, candidate, location))
 
+            _emit_progress(0.6)
             match_events.sort(key=lambda item: (item[0], item[1]))
 
             for _, _, candidate, location in match_events:
                 consume_candidate(candidate, location)
 
             # 정규식 미검출 조각에 대해서만 보조 탐색(포함/유사도)을 수행한다.
-            for idx, (_, _, location, source_text) in enumerate(offsets):
+            unmatched_indices = [
+                idx for idx in range(len(offsets))
+                if idx not in matched_offset_indices
+            ]
+            unmatched_total = len(unmatched_indices)
+
+            for processed, idx in enumerate(unmatched_indices, 1):
+                _, _, location, source_text = offsets[idx]
+                if processed % 100 == 0 or processed == unmatched_total:
+                    ratio = processed / unmatched_total if unmatched_total else 1.0
+                    _emit_progress(0.6 + 0.35 * ratio)
+
                 if idx in matched_offset_indices:
                     continue
                 text = source_text.strip()
@@ -1653,10 +1703,15 @@ class ReviewEngine:
 
                 for candidate in cached_candidates:
                     consume_candidate(candidate, location)
+        else:
+            _emit_progress(0.6)
 
         matched = sum(1 for r in results if r["status"] == "일치")
         mismatched = sum(1 for r in results if r["status"] == "불일치")
-        warnings = sum(1 for r in results if r["status"] == "경고")
+        # 경고/기타 상태를 warning 집계로 포함해 total 정합성을 보장한다.
+        warnings = sum(
+            1 for r in results if r["status"] not in {"일치", "불일치"}
+        )
         total = len(results)
 
         if total == 0:
@@ -1666,10 +1721,11 @@ class ReviewEngine:
         else:
             overall = "검토필요"
 
+        _emit_progress(1.0)
         return {
             "file": filename, "path": filepath,
             "total": total, "matched": matched,
-            "mismatched": mismatched, "overall": overall,
+            "mismatched": mismatched, "warning": warnings, "overall": overall,
             "details": results, "error": None
         }
 
