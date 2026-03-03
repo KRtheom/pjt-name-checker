@@ -146,7 +146,37 @@ def _merge_pdf_prefix_fragments(texts: list) -> list:
 
     # consumed에 포함되었지만 merged에서 대체되지 않은 항목 제거
     # (이미 위 로직에서 처리되므로 추가 작업 불필요)
-    return merged
+
+    # ── 비괄호형 접두어 결합 복원 ──
+    # PyMuPDF 폴백에서 "접두어+명칭" 결합 형태가 나오는 문제를 보정한다.
+    sorted_prefixes = sorted(KNOWN_PREFIXES, key=len, reverse=True)
+    restored: list[tuple[str, str]] = []
+    for loc, txt in merged:
+        stripped = txt.strip()
+
+        # 이미 괄호형 접두어가 있으면 기존 값을 유지한다.
+        if stripped.startswith('('):
+            restored.append((loc, txt))
+            continue
+
+        # 특수기호를 제외한 본문에서 접두어를 긴 순서대로 매칭한다.
+        clean = stripped.lstrip(STRIP_CHARS).strip()
+        matched_prefix = ""
+        for pfx in sorted_prefixes:
+            if clean.startswith(pfx) and len(clean) > len(pfx):
+                matched_prefix = pfx
+                break
+
+        if matched_prefix:
+            bare_name = clean[len(matched_prefix):]
+            # 앞쪽 특수기호는 유지하고 접두어만 괄호형으로 복원한다.
+            leading = stripped[:len(stripped) - len(clean)]
+            restored_text = f"{leading}({matched_prefix}){bare_name}"
+            restored.append((loc, restored_text))
+        else:
+            restored.append((loc, txt))
+
+    return restored
 
 
 def _extract_pages_pdfplumber(
