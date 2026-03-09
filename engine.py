@@ -27,6 +27,9 @@ from typing import Optional
 # 마지막 마스터 로드 실패 사유(서버 동기화 실패 메시지 보관)
 _LAST_MASTER_LOAD_ERROR = ""
 
+# Google Sheets CSV export 등에서 내려오는 헤더 행 후보
+MASTER_NAME_HEADERS = {"공사약식명", "공사명", "공사명칭"}
+
 
 # ═══════════════════════════════════════════════════════════
 #  파일 텍스트 추출 (지연 import)
@@ -678,6 +681,8 @@ def _sanitize_master_names(raw_names: list) -> list:
         if raw is None:
             continue
         name = str(raw).strip().lstrip("\ufeff")
+        if name in MASTER_NAME_HEADERS:
+            continue
         if not name or name in seen:
             continue
         seen.add(name)
@@ -702,6 +707,29 @@ def _decode_master_csv_text(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _normalize_known_prefix_punctuation(text: str) -> str:
+    """선두 접두어 괄호 안 쉼표를 마침표로 정규화한다.
+
+    Args:
+        text: 원본 후보 문자열.
+
+    Returns:
+        KNOWN_PREFIXES에 해당하는 접두어만 쉼표/마침표 표기를 통일한 문자열.
+    """
+    clean = str(text or "").strip()
+    pm = PREFIX_PATTERN.match(clean)
+    if not pm:
+        return clean
+
+    prefix = pm.group(1).strip()
+    normalized_prefix = re.sub(r"\s*,\s*", ".", prefix)
+    if normalized_prefix == prefix or normalized_prefix not in KNOWN_PREFIXES:
+        return clean
+
+    bare = pm.group(2).strip()
+    return f"({normalized_prefix}){bare}"
+
+
 def strip_known_prefix(text: str) -> tuple[str, str]:
     """텍스트 앞에 붙은 알려진 접두어를 분리한다.
 
@@ -722,6 +750,7 @@ def strip_known_prefix(text: str) -> tuple[str, str]:
     """
     raw = str(text or "")
     cleaned = raw.strip().strip(STRIP_CHARS).strip()
+    cleaned = _normalize_known_prefix_punctuation(cleaned)
     if not cleaned:
         return "", ""
 
@@ -753,7 +782,7 @@ def split_official_name(name: str) -> tuple[str, str]:
     Returns:
         `(접두어, 순수명칭)` 튜플.
     """
-    clean = str(name or "").strip()
+    clean = _normalize_known_prefix_punctuation(str(name or "").strip())
     pm = PREFIX_PATTERN.match(clean)
     if pm:
         return pm.group(1).strip(), pm.group(2).strip()
@@ -1371,19 +1400,22 @@ class NameMatcher:
         if not text or self._is_excluded(text):
             return None
 
+        match_text = _normalize_known_prefix_punctuation(text)
+
         # STEP 1: 공식명칭 포함 + 경계 판정(통과/경고)
-        inclusion_result = self._check_official_inclusion(text)
+        inclusion_result = self._check_official_inclusion(match_text)
         if inclusion_result:
+            inclusion_result["input"] = text
             return inclusion_result
 
         # STEP 2: 접두어 분리 매칭
-        normalized = self._normalize(text)
-        split_prefix, split_bare = strip_known_prefix(text)
+        normalized = self._normalize(match_text)
+        split_prefix, split_bare = strip_known_prefix(match_text)
         split_bare = split_bare or normalized
-        stripped_input = text.strip().strip(STRIP_CHARS).strip()
+        stripped_input = match_text.strip().strip(STRIP_CHARS).strip()
         is_direct_prefix_form = (
             bool(split_prefix)
-            and not self._has_prefix(text)
+            and not self._has_prefix(match_text)
             and stripped_input.startswith(split_prefix)
         )
 

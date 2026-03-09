@@ -35,7 +35,7 @@ from engine import (
     save_excel_report,
 )
 
-MASTER_DB_URL = "https://www.krindus.co.kr/resources/upload/itdata/MasterDB.csv"
+MASTER_DB_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS3uQwt5vWA5IwvtNo2beXxJqSfMAWkJNBa6GhQIn8yFNwXRpy7lrOEE1hhSsHfWehmeqq9fvzpeed2/pub?gid=0&single=true&output=csv"
 APP_VERSION = "v1.0"
 
 
@@ -205,7 +205,7 @@ class App(ctk.CTk):
         sb.pack(side="right", fill="y", padx=(0, 4), pady=(8, 4))
 
         self.file_listbox = tk.Listbox(
-            lf, font=(self.SYSTEM_FONT, 13),
+            lf, font=(self.SYSTEM_FONT, 15),
             selectmode=tk.EXTENDED, activestyle="none",
             bg="white",
             yscrollcommand=sb.set
