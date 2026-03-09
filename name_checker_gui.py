@@ -86,7 +86,7 @@ class App(ctk.CTk):
         self.LARGE_FONT = ctk.CTkFont(
             family=self.SYSTEM_FONT, size=15, weight="normal"
         )
-        self.MONO_FONT = ctk.CTkFont(family="Consolas", size=12)
+        self.MONO_FONT = ctk.CTkFont(family="Consolas", size=13)
 
         self.tk.call('tk', 'scaling', 1.0)
         ctk.set_widget_scaling(1.1)
@@ -205,7 +205,7 @@ class App(ctk.CTk):
         sb.pack(side="right", fill="y", padx=(0, 4), pady=(8, 4))
 
         self.file_listbox = tk.Listbox(
-            lf, font=(self.SYSTEM_FONT, 11),
+            lf, font=(self.SYSTEM_FONT, 13),
             selectmode=tk.EXTENDED, activestyle="none",
             bg="white",
             yscrollcommand=sb.set
