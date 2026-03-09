@@ -54,6 +54,67 @@ STRIP_CHARS = "▶□■❑◆●○◇△▽☆★※→←↑↓·"
 PREFIX_PATTERN = re.compile(r'^\(([^)]*)\)\s*(.*)$')
 
 
+def _is_pdf_name_fragment(text: str) -> bool:
+    """PDF 줄 조각이 공사명 일부로 보이는지 판정한다."""
+    clean = str(text or "").strip().strip(STRIP_CHARS).strip()
+    if not clean:
+        return False
+    if clean.startswith(("■", "※", "[", "【", "(")):
+        return False
+    if clean in {
+        "구 분", "단위", "공사명", "발주수요", "기관", "개찰일시",
+        "공사금액", "사업명", "금액", "비고", "추진일정", "사업유형",
+        "수주유형", "사업개발팀", "그룹", "개요", "실시사항", "실행내역",
+    }:
+        return False
+    if any(token in clean for token in (":", "：", "%", "→")):
+        return False
+    if re.fullmatch(r'[\d\s.,%~()/:-]+', clean):
+        return False
+    if len(clean) > 20:
+        return False
+    return bool(re.search(r'[가-힣A-Za-z0-9]', clean))
+
+
+def _collect_pdf_name_fragments(
+    texts: list[tuple[str, str]],
+    start_index: int,
+    max_fragments: int = 3,
+) -> tuple[list[str], int]:
+    """prefix-only 라인 뒤에 이어진 공사명 조각을 수집한다."""
+    fragments: list[str] = []
+    idx = start_index
+
+    while idx < len(texts) and len(fragments) < max_fragments:
+        candidate = str(texts[idx][1]).strip()
+        if not _is_pdf_name_fragment(candidate):
+            break
+
+        fragments.append(candidate)
+        idx += 1
+
+        if idx < len(texts):
+            upcoming = str(texts[idx][1]).strip()
+            if upcoming.startswith(("■", "※", "[", "【")) or "현황" in upcoming:
+                break
+
+    return fragments, idx
+
+
+def _extract_pdf_detached_year(
+    texts: list[tuple[str, str]],
+    start_index: int,
+    lookahead: int = 3,
+) -> tuple[str, int]:
+    """이름 조각 뒤에 떨어진 2자리 연도를 찾는다."""
+    for idx in range(start_index, min(len(texts), start_index + lookahead)):
+        candidate = str(texts[idx][1]).strip()
+        collapsed = re.sub(r'[()\s]', '', candidate)
+        if re.fullmatch(r'\d{2}', collapsed):
+            return collapsed, idx + 1
+    return "", start_index
+
+
 def extract_from_xlsx(filepath: str) -> list:
     """엑셀 파일에서 셀 텍스트를 추출한다.
 
@@ -105,6 +166,40 @@ def _merge_pdf_prefix_fragments(texts: list) -> list:
             continue
 
         loc_cur, txt_cur = texts[i]
+        stripped_cur = txt_cur.strip()
+
+        # 패턴 감지: "접두어" 다음에 이름 조각/연도가 분리된 경우
+        if stripped_cur in KNOWN_PREFIXES:
+            fragments, next_index = _collect_pdf_name_fragments(texts, i + 1)
+            merged_name = "".join(fragments).replace(" ", "")
+            can_merge = False
+            if merged_name.startswith(stripped_cur):
+                merged_name = merged_name[len(stripped_cur):]
+                can_merge = True
+            elif merged_name.startswith("년"):
+                year, year_index = _extract_pdf_detached_year(texts, next_index)
+                if year:
+                    merged_name = f"{year}{merged_name}"
+                    next_index = year_index
+                    can_merge = True
+
+            if can_merge and merged_name and len(merged_name) >= 4:
+                merged.append((loc_cur, f"({stripped_cur}){merged_name}"))
+                consumed.update(range(i + 1, next_index))
+                i = next_index
+                continue
+
+        # 패턴 감지: "(접두어)" 다음에 이름 조각이 1~3줄로 이어지는 경우
+        if stripped_cur.startswith("(") and stripped_cur.endswith(")"):
+            prefix = stripped_cur[1:-1].strip().replace(",", ".")
+            if prefix in KNOWN_PREFIXES:
+                fragments, next_index = _collect_pdf_name_fragments(texts, i + 1)
+                merged_name = "".join(fragments).replace(" ", "")
+                if merged_name and len(merged_name) >= 4:
+                    merged.append((loc_cur, f"({prefix}){merged_name}"))
+                    consumed.update(range(i + 1, next_index))
+                    i = next_index
+                    continue
 
         # 패턴 감지: 현재 라인이 ")" + 한글/영문/숫자로 시작하는 경우
         if (
@@ -186,8 +281,9 @@ def _extract_pages_pdfplumber(
     filepath: str,
     total_pages: int,
     timeout_per_page: float = 2.0,
+    page_nums: Optional[list[int]] = None,
 ) -> dict[int, Optional[list[tuple[str, str]]]]:
-    """pdfplumber로 전체 페이지를 추출한다. PDF는 한 번만 연다.
+    """pdfplumber로 지정 페이지들을 추출한다. PDF는 한 번만 연다.
 
     각 페이지 추출에 개별 타임아웃을 적용하며, 타임아웃 또는 오류 발생 시
     해당 페이지는 ``None``으로 기록하여 호출측에서 폴백 처리하도록 한다.
@@ -196,11 +292,18 @@ def _extract_pages_pdfplumber(
         filepath: PDF 파일 경로.
         total_pages: 전체 페이지 수.
         timeout_per_page: 페이지당 추출 타임아웃(초).
+        page_nums: 추출할 1-based 페이지 번호 목록. ``None``이면 전체 페이지.
 
     Returns:
         ``{페이지번호: [(위치, 텍스트), ...] 또는 None}`` 딕셔너리.
     """
     import pdfplumber
+
+    target_pages = sorted(
+        set(page_nums if page_nums is not None else range(1, total_pages + 1))
+    )
+    if not target_pages:
+        return {}
 
     results: dict[int, Optional[list[tuple[str, str]]]] = {}
 
@@ -208,10 +311,10 @@ def _extract_pages_pdfplumber(
         pdf = pdfplumber.open(filepath)
     except Exception:
         # pdfplumber로 PDF를 열 수 없으면 전 페이지 None 반환
-        return {pg: None for pg in range(1, total_pages + 1)}
+        return {pg: None for pg in target_pages}
 
     try:
-        for page_num in range(1, total_pages + 1):
+        for page_num in target_pages:
             if page_num > len(pdf.pages):
                 results[page_num] = []
                 continue
@@ -306,11 +409,74 @@ def _extract_pages_pymupdf(
     return results
 
 
+def _has_pdf_prefix_split(page_texts: list[tuple[str, str]]) -> bool:
+    """PyMuPDF 추출 결과에서 행분리 의심 패턴을 감지한다.
+
+    Args:
+        page_texts: 단일 페이지의 ``(위치, 텍스트)`` 목록.
+
+    Returns:
+        접두어/명칭이 다른 줄로 분리된 정황이 있으면 ``True``.
+    """
+    name_like_re = re.compile(r'[가-힣A-Za-z]')
+
+    for idx, (_, raw_text) in enumerate(page_texts):
+        line = str(raw_text).strip()
+        if not line:
+            continue
+
+        if line.startswith("(") and line.endswith(")"):
+            inner = line[1:-1].strip().replace(",", ".")
+            if inner in KNOWN_PREFIXES:
+                fragments, _ = _collect_pdf_name_fragments(page_texts, idx + 1)
+                merged_name = "".join(fragments).replace(" ", "")
+                if not merged_name or len(merged_name) < 4:
+                    return True
+                continue
+
+        if idx + 1 >= len(page_texts):
+            continue
+
+        next_line = str(page_texts[idx + 1][1]).strip()
+        if not next_line or not name_like_re.search(next_line):
+            continue
+
+        token = line.strip(STRIP_CHARS).strip()
+        normalized_token = token.strip("()").replace(",", ".")
+        if not normalized_token or len(normalized_token) >= 5:
+            continue
+
+        if (
+            normalized_token in KNOWN_PREFIXES
+            or (
+                len(normalized_token) >= 2
+                and any(prefix.startswith(normalized_token) for prefix in KNOWN_PREFIXES)
+            )
+        ):
+            fragments, next_index = _collect_pdf_name_fragments(page_texts, idx + 1)
+            if not fragments:
+                continue
+
+            merged_name = "".join(fragments).replace(" ", "")
+            if merged_name.startswith(normalized_token):
+                merged_name = merged_name[len(normalized_token):]
+                if merged_name and len(merged_name) >= 4:
+                    continue
+                return True
+
+            if merged_name.startswith("년"):
+                return True
+
+            return True
+
+    return False
+
+
 def extract_from_pdf(filepath: str, progress_callback=None) -> list:
     """PDF 파일에서 줄 단위 텍스트를 추출한다.
 
-    pdfplumber로 전체 페이지를 추출하고(PDF 1회 오픈, 페이지당 타임아웃 2초),
-    실패 페이지만 PyMuPDF로 폴백한다(PDF 1회 오픈).
+    PyMuPDF로 전체 페이지를 먼저 추출하고, 접두어/명칭 행분리가 의심되는
+    페이지와 PyMuPDF 실패 페이지만 pdfplumber로 보완한다.
     최종 결과에 조각 병합 후처리를 적용한다.
 
     Args:
@@ -345,31 +511,61 @@ def extract_from_pdf(filepath: str, progress_callback=None) -> list:
     if total_pages == 0:
         return []
 
-    # ── 1단계: pdfplumber 전체 추출 (PDF 1회 오픈) ──
-    plumber_results = _extract_pages_pdfplumber(
-        filepath, total_pages, timeout_per_page=2.0
-    )
-    _emit_progress(0.15)
+    all_pages = list(range(1, total_pages + 1))
 
-    # ── 2단계: 실패 페이지 수집 → PyMuPDF 일괄 폴백 (PDF 1회 오픈) ──
-    failed_pages = [
-        pg for pg in range(1, total_pages + 1)
-        if plumber_results.get(pg) is None
-    ]
-    pymupdf_results = _extract_pages_pymupdf(filepath, failed_pages)
-    _emit_progress(0.25)
+    # ── 1단계: PyMuPDF 전체 추출 (빠른 기본 경로) ──
+    pymupdf_results = _extract_pages_pymupdf(filepath, all_pages)
+    _emit_progress(0.2)
+
+    # PyMuPDF를 사용할 수 없거나 전체 실패한 경우에만 pdfplumber 전체 추출로 폴백한다.
+    if not pymupdf_results:
+        plumber_results = _extract_pages_pdfplumber(
+            filepath, total_pages, timeout_per_page=3.0
+        )
+        _emit_progress(0.27)
+
+        texts: list[tuple[str, str]] = []
+        for pg in all_pages:
+            texts.extend(plumber_results.get(pg) or [])
+            _emit_progress(0.27 + 0.03 * (pg / total_pages))
+
+        _emit_progress(0.3)
+        return _merge_pdf_prefix_fragments(texts)
+
+    suspicious_pages: list[int] = []
+    failed_pages: list[int] = []
+    for pg in all_pages:
+        page_data = pymupdf_results.get(pg)
+        if page_data is None:
+            failed_pages.append(pg)
+            continue
+        if _has_pdf_prefix_split(page_data):
+            suspicious_pages.append(pg)
+
+    _emit_progress(0.23)
+
+    # ── 2단계: 의심/실패 페이지만 pdfplumber 보완 ──
+    plumber_pages = sorted(set(suspicious_pages + failed_pages))
+    plumber_results: dict[int, Optional[list[tuple[str, str]]]] = {}
+    if plumber_pages:
+        plumber_results = _extract_pages_pdfplumber(
+            filepath,
+            total_pages,
+            timeout_per_page=3.0,
+            page_nums=plumber_pages,
+        )
+    _emit_progress(0.27)
 
     # ── 3단계: 결과 조립 ──
     texts: list[tuple[str, str]] = []
-    for pg in range(1, total_pages + 1):
-        page_data = plumber_results.get(pg)
-        if page_data is not None:
-            texts.extend(page_data)
-        else:
-            fallback = pymupdf_results.get(pg, [])
-            texts.extend(fallback)
-        # 페이지 조립 진행률은 0.25~0.30 구간으로 반영한다.
-        _emit_progress(0.25 + 0.05 * (pg / total_pages))
+    for pg in all_pages:
+        page_data = pymupdf_results.get(pg, [])
+        plumber_page = plumber_results.get(pg)
+        if plumber_page is not None:
+            page_data = plumber_page
+        texts.extend(page_data)
+        # 페이지 조립 진행률은 0.27~0.30 구간으로 반영한다.
+        _emit_progress(0.27 + 0.03 * (pg / total_pages))
 
     _emit_progress(0.3)
 
