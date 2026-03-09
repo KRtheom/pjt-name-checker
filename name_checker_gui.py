@@ -12,6 +12,7 @@ from time import perf_counter
 
 import customtkinter as ctk
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox
 try:
     from PIL import Image, ImageTk
@@ -61,6 +62,36 @@ class App(ctk.CTk):
             self.iconbitmap(self._icon_path)
 
         ctk.set_appearance_mode("light")
+        self.PREFERRED_FONTS = [
+            "맑은 고딕", "Malgun Gothic", "Segoe UI",
+            "Noto Sans CJK KR", "NanumGothic",
+            "Arial Unicode MS", "TkDefaultFont"
+        ]
+        self.SYSTEM_FONT = next(
+            (f for f in self.PREFERRED_FONTS if f in tkfont.families()),
+            "TkDefaultFont"
+        )
+        self.DEFAULT_FONT = ctk.CTkFont(
+            family=self.SYSTEM_FONT, size=12, weight="normal"
+        )
+        self.BOLD_FONT = ctk.CTkFont(
+            family=self.SYSTEM_FONT, size=14, weight="bold"
+        )
+        self.TITLE_FONT = ctk.CTkFont(
+            family=self.SYSTEM_FONT, size=22, weight="bold"
+        )
+        self.SMALL_FONT = ctk.CTkFont(
+            family=self.SYSTEM_FONT, size=11, weight="normal"
+        )
+        self.LARGE_FONT = ctk.CTkFont(
+            family=self.SYSTEM_FONT, size=15, weight="normal"
+        )
+        self.MONO_FONT = ctk.CTkFont(family="Consolas", size=12)
+
+        self.tk.call('tk', 'scaling', 1.0)
+        ctk.set_widget_scaling(1.1)
+
+        print(f"시스템 폰트 적용: {self.SYSTEM_FONT}")
         ctk.set_default_color_theme("blue")
 
         self.master_names, self.db_source, self.db_date = load_master_names(MASTER_DB_URL)
@@ -103,7 +134,7 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(
             top, text="  공사명칭 검토기",
-            font=ctk.CTkFont(size=20, weight="bold"),
+            font=self.TITLE_FONT,
             text_color="white"
         ).pack(side="left", padx=15, pady=12)
 
@@ -115,7 +146,7 @@ class App(ctk.CTk):
             fg_color="#4472C4",
             hover_color="#3A5FAE",
             text_color="white",
-            font=ctk.CTkFont(size=12),
+            font=self.DEFAULT_FONT,
             command=self._show_help,
         )
         self.help_btn.pack(side="right", padx=15, pady=12)
@@ -131,7 +162,7 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(
             left, text="검토 대상 파일",
-            font=ctk.CTkFont(size=14, weight="bold")
+            font=self.BOLD_FONT
         ).pack(pady=(10, 6), padx=10, anchor="w")
 
         bf = ctk.CTkFrame(left, fg_color="transparent")
@@ -174,7 +205,7 @@ class App(ctk.CTk):
         sb.pack(side="right", fill="y", padx=(0, 4), pady=(8, 4))
 
         self.file_listbox = tk.Listbox(
-            lf, font=("맑은 고딕", 10),
+            lf, font=(self.SYSTEM_FONT, 11),
             selectmode=tk.EXTENDED, activestyle="none",
             bg="white",
             yscrollcommand=sb.set
@@ -202,14 +233,14 @@ class App(ctk.CTk):
                 pass
 
         self.count_label = ctk.CTkLabel(
-            left, text="파일 0개", font=ctk.CTkFont(size=11)
+            left, text="파일 0개", font=self.SMALL_FONT
         )
         self.count_label.pack(padx=10, pady=(0, 2), anchor="w")
 
         self.support_label = ctk.CTkLabel(
             left,
             text="지원 형식: HWP · HWPX · PDF · XLSX · DOCX · CSV",
-            font=ctk.CTkFont(size=15),
+            font=self.LARGE_FONT,
             text_color="gray"
         )
         self.support_label.pack(padx=10, pady=(0, 5), anchor="w")
@@ -220,12 +251,12 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(
             right, text="불일치 검토 결과",
-            font=ctk.CTkFont(size=14, weight="bold")
+            font=self.BOLD_FONT
         ).pack(pady=(10, 6), padx=10, anchor="w")
 
         self.result_box = ctk.CTkTextbox(
             right,
-            font=ctk.CTkFont(family="Consolas", size=11),
+            font=self.MONO_FONT,
             wrap="word"
         )
         self.result_box.pack(fill="both", expand=True,
@@ -242,7 +273,7 @@ class App(ctk.CTk):
         self.db_source_label = ctk.CTkLabel(
             bottom,
             text="DB상태 : -",
-            font=ctk.CTkFont(size=11, weight="bold"),
+            font=self.SMALL_FONT,
             text_color="#2F5496"
         )
         self.sync_db_btn = ctk.CTkButton(
@@ -260,7 +291,7 @@ class App(ctk.CTk):
         self.status_label = ctk.CTkLabel(
             bottom,
             text="파일을 추가한 후 [검토 시작]을 눌러주세요.",
-            font=ctk.CTkFont(size=11)
+            font=self.SMALL_FONT
         )
         self.status_label.pack(side="left", padx=(8, 0), fill="x", expand=True)
 
@@ -268,7 +299,7 @@ class App(ctk.CTk):
             bottom, text="리포트 저장 (Excel)",
             width=170, height=38,
             fg_color="#28A745", hover_color="#218838",
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=self.BOLD_FONT,
             command=self._save_report
         )
         self.report_btn.pack(side="right", padx=(8, 0))
@@ -277,7 +308,7 @@ class App(ctk.CTk):
             bottom, text="스냅샷 보기",
             width=130, height=38,
             fg_color="#17A2B8", hover_color="#138496",
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=self.BOLD_FONT,
             command=self._show_snapshots
         )
         self.snapshot_btn.pack(side="right", padx=(8, 0))
@@ -285,7 +316,7 @@ class App(ctk.CTk):
         self.review_btn = ctk.CTkButton(
             bottom, text="검토 시작",
             width=140, height=38,
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=self.BOLD_FONT,
             command=self._start_review
         )
         self.review_btn.pack(side="right")
@@ -427,7 +458,7 @@ class App(ctk.CTk):
         self.drop_hint_label = ctk.CTkLabel(
             parent,
             text="📂 파일을 여기에 드래그하거나\n[파일 추가] 버튼을 사용하세요",
-            font=ctk.CTkFont(size=20),
+            font=self.TITLE_FONT,
             text_color="#999999",
             justify="center"
         )
@@ -888,7 +919,7 @@ class App(ctk.CTk):
 
         textbox = ctk.CTkTextbox(
             popup,
-            font=ctk.CTkFont(family="맑은 고딕", size=13),
+            font=self.DEFAULT_FONT,
             wrap="word",
         )
         textbox.pack(fill="both", expand=True, padx=15, pady=15)
@@ -1018,7 +1049,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(
             info_frame,
             text=f"불일치 페이지 {len(pdf_snapshots)}개",
-            font=ctk.CTkFont(size=14, weight="bold")
+            font=self.BOLD_FONT
         ).pack(side="left")
 
         def _save_all_snapshots():
@@ -1053,7 +1084,7 @@ class App(ctk.CTk):
             ctk.CTkLabel(
                 scroll_frame,
                 text=f"📄 {fname} — P{page_num}",
-                font=ctk.CTkFont(size=13, weight="bold")
+                font=self.BOLD_FONT
             ).pack(pady=(12, 4), anchor="w")
 
             pil_image = Image.open(io.BytesIO(png_bytes))
