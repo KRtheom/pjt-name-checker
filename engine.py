@@ -25,9 +25,13 @@ import re
 import bisect
 import queue
 import threading
+from multiprocessing import Pool
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Optional
+
+# PDF 병렬 추출 워커 수 (CPU 코어 기반, 최대 8)
+PDF_POOL_WORKERS = max(4, min(os.cpu_count() // 2 or 4, 8))
 
 # 마지막 마스터 로드 실패 사유(서버 동기화 실패 메시지 보관)
 _LAST_MASTER_LOAD_ERROR = ""
@@ -138,6 +142,33 @@ def extract_from_xlsx(filepath: str) -> list:
     return texts
 
 
+def _extract_single_page_pdfplumber(args):
+    """단일 페이지를 pdfplumber로 추출한다.
+
+    Args:
+        args: `(filepath, page_num)` 튜플. `page_num`은 1-based.
+
+    Returns:
+        `(page_num, [(위치, 텍스트), ...])` 튜플.
+    """
+    filepath, page_num = args
+    import pdfplumber
+
+    results = []
+    try:
+        with pdfplumber.open(filepath) as pdf:
+            page_idx = page_num - 1
+            if 0 <= page_idx < len(pdf.pages):
+                page_text = pdf.pages[page_idx].extract_text() or ""
+                for line_num, line in enumerate(page_text.splitlines(), 1):
+                    stripped = line.strip()
+                    if stripped:
+                        results.append((f"P{page_num} L{line_num}", stripped))
+    except Exception:
+        pass
+    return page_num, results
+
+
 def _reconstruct_prefix(bare: str, lines: list, line_idx: int,
                         master_set: set, known_prefixes: tuple) -> str | None:
     """PyMuPDF 텍스트 분리로 인해 접두어가 누락된 순수명칭을 재조합한다.
@@ -231,44 +262,25 @@ def extract_from_pdf(filepath: str, progress_callback=None) -> list:
             if total_pages == 0:
                 return []
 
-            fitz_doc = None
-            try:
-                import fitz
-                fitz_doc = fitz.open(filepath)
-            except Exception:
-                fitz_doc = None
+        _emit_progress(0.05)
 
-            try:
-                _emit_progress(0.05)
+        try:
+            page_args = [(filepath, pg_num) for pg_num in range(1, total_pages + 1)]
+            with Pool(PDF_POOL_WORKERS) as pool:
+                page_results = pool.map(_extract_single_page_pdfplumber, page_args)
 
-                for pg_idx, page in enumerate(pdf.pages):
-                    page_text = ""
-                    try:
-                        page_text = page.extract_text() or ""
-                    except Exception:
-                        page_text = ""
+            page_results.sort(key=lambda item: item[0])
 
-                    if not page_text and fitz_doc is not None and pg_idx < len(fitz_doc):
-                        try:
-                            page_text = fitz_doc[pg_idx].get_text() or ""
-                        except Exception:
-                            page_text = ""
+            parallel_texts: list[tuple[str, str]] = []
+            for page_num, lines in page_results:
+                parallel_texts.extend(lines)
+                _emit_progress(0.05 + 0.25 * (page_num / total_pages))
 
-                    if page_text:
-                        page_num = pg_idx + 1
-                        for line_num, line in enumerate(page_text.splitlines(), 1):
-                            stripped = line.strip()
-                            if stripped:
-                                location = f"P{page_num} L{line_num}"
-                                texts.append((location, stripped))
-
-                    _emit_progress(0.05 + 0.25 * ((pg_idx + 1) / total_pages))
-            finally:
-                if fitz_doc is not None:
-                    fitz_doc.close()
-
-        _emit_progress(0.3)
-        return texts
+            _emit_progress(0.3)
+            if parallel_texts:
+                return parallel_texts
+        except Exception:
+            pass
     except Exception:
         pass
 
