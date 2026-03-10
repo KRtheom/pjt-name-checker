@@ -11,8 +11,13 @@
     - 접두어 분리 기반 보정 매칭
     - 검토 결과 Excel 리포트 생성
 
+불일치 사유 3분류:
+    - 공사명 불일치: 순수명칭 자체가 다름
+    - 접두어(사업유형) 불일치: 순수명칭은 맞으나 접두어가 다름
+    - 연도 불일치: 접두어·공사명은 같고 연도만 다름
+
 버전:
-    v3.1
+    v3.2
 """
 
 import os
@@ -53,66 +58,60 @@ STRIP_CHARS = "▶□■❑◆●○◇△▽☆★※→←↑↓·"
 # 공식명칭 접두어 파싱용 정규식
 PREFIX_PATTERN = re.compile(r'^\(([^)]*)\)\s*(.*)$')
 
+# 명칭 앞뒤에 붙어도 경고로 보지 않을 단순 기호/조사 패턴
+_STRIP_SURROUNDING = re.compile(
+    r'^[『「\["\s]+'
+    r'|'
+    r'[』」\],\."外(（\s]+$'
+    r'|'
+    r'(?:은|는|이|가|을|를|의|과|와|도|만)+$'
+)
 
-def _is_pdf_name_fragment(text: str) -> bool:
-    """PDF 줄 조각이 공사명 일부로 보이는지 판정한다."""
-    clean = str(text or "").strip().strip(STRIP_CHARS).strip()
-    if not clean:
+# 순수명칭 내 연도 숫자 패턴 (예: "26년", "2026년")
+_YEAR_NUM_RE = re.compile(r"(\d{2,4})\s*년")
+
+
+def _is_year_only_diff(bare_a: str, bare_b: str) -> bool:
+    """두 순수명칭이 연도 부분만 다른지 판별한다.
+
+    Args:
+        bare_a: 첫 번째 순수명칭.
+        bare_b: 두 번째 순수명칭.
+
+    Returns:
+        연도 숫자만 다르고 나머지가 동일하면 True.
+    """
+    placeholder = "\x00YEAR\x00"
+    norm_a = _YEAR_NUM_RE.sub(placeholder, bare_a)
+    norm_b = _YEAR_NUM_RE.sub(placeholder, bare_b)
+    if norm_a != norm_b:
         return False
-    if clean.startswith(("■", "※", "[", "【", "(")):
-        return False
-    if clean in {
-        "구 분", "단위", "공사명", "발주수요", "기관", "개찰일시",
-        "공사금액", "사업명", "금액", "비고", "추진일정", "사업유형",
-        "수주유형", "사업개발팀", "그룹", "개요", "실시사항", "실행내역",
-    }:
-        return False
-    if any(token in clean for token in (":", "：", "%", "→")):
-        return False
-    if re.fullmatch(r'[\d\s.,%~()/:-]+', clean):
-        return False
-    if len(clean) > 20:
-        return False
-    return bool(re.search(r'[가-힣A-Za-z0-9]', clean))
+    years_a = _YEAR_NUM_RE.findall(bare_a)
+    years_b = _YEAR_NUM_RE.findall(bare_b)
+    return years_a != years_b
 
 
-def _collect_pdf_name_fragments(
-    texts: list[tuple[str, str]],
-    start_index: int,
-    max_fragments: int = 3,
-) -> tuple[list[str], int]:
-    """prefix-only 라인 뒤에 이어진 공사명 조각을 수집한다."""
-    fragments: list[str] = []
-    idx = start_index
-
-    while idx < len(texts) and len(fragments) < max_fragments:
-        candidate = str(texts[idx][1]).strip()
-        if not _is_pdf_name_fragment(candidate):
-            break
-
-        fragments.append(candidate)
-        idx += 1
-
-        if idx < len(texts):
-            upcoming = str(texts[idx][1]).strip()
-            if upcoming.startswith(("■", "※", "[", "【")) or "현황" in upcoming:
-                break
-
-    return fragments, idx
+def _strip_surrounding(name: str) -> str:
+    """명칭 바깥의 단순 기호/조사를 제거한다."""
+    cleaned = str(name or "").strip()
+    previous = None
+    while cleaned != previous:
+        previous = cleaned
+        cleaned = _STRIP_SURROUNDING.sub("", cleaned).strip()
+    return cleaned
 
 
-def _extract_pdf_detached_year(
-    texts: list[tuple[str, str]],
-    start_index: int,
-    lookahead: int = 3,
-) -> tuple[str, int]:
-    """이름 조각 뒤에 떨어진 2자리 연도를 찾는다."""
-    for idx in range(start_index, min(len(texts), start_index + lookahead)):
-        candidate = str(texts[idx][1]).strip()
-        collapsed = re.sub(r'[()\s]', '', candidate)
-        if re.fullmatch(r'\d{2}', collapsed):
-            return collapsed, idx + 1
-    return "", start_index
+def _get_attached_side_segment(text: str, index: int, is_left: bool) -> str:
+    """명칭 좌우에 공백 없이 붙은 연속 토큰을 추출한다."""
+    source = text[:index] if is_left else text[index:]
+    if not source:
+        return ""
+
+    if is_left:
+        match = re.search(r"\S+$", source)
+    else:
+        match = re.match(r"^\S+", source)
+    return match.group(0) if match else ""
 
 
 def extract_from_xlsx(filepath: str) -> list:
@@ -139,352 +138,78 @@ def extract_from_xlsx(filepath: str) -> list:
     return texts
 
 
-def _merge_pdf_prefix_fragments(texts: list) -> list:
-    """PDF 추출 결과에서 분리된 접두어 조각을 병합한다.
-
-    PyMuPDF가 표 셀 내부 텍스트를 라인 단위로 분할할 때
-    ``(접두어)명칭`` 이 ``접두어텍스트`` + ``(`` + ``)명칭`` 으로
-    3조각 나는 경우를 감지하여 ``(접두어)명칭`` 으로 복원한다.
+def _reconstruct_prefix(bare: str, lines: list, line_idx: int,
+                        master_set: set, known_prefixes: tuple) -> str | None:
+    """PyMuPDF 텍스트 분리로 인해 접두어가 누락된 순수명칭을 재조합한다.
 
     Args:
-        texts: ``(위치, 텍스트)`` 튜플 목록 (extract_from_pdf 원본 결과).
+        bare: 순수명칭 문자열.
+        lines: 해당 페이지의 전체 줄 목록.
+        line_idx: bare가 위치한 줄 인덱스.
+        master_set: 공식명칭 집합.
+        known_prefixes: 알려진 접두어 튜플.
 
     Returns:
-        병합 처리된 ``(위치, 텍스트)`` 튜플 목록.
+        재조합된 공식명칭 또는 None.
     """
-    if len(texts) < 3:
-        return texts
+    cur = lines[line_idx].strip()
+    sorted_pfx = sorted(known_prefixes, key=len, reverse=True)
 
-    # 병합 대상으로 소비된 인덱스를 기록한다.
-    consumed: set[int] = set()
-    merged: list[tuple[str, str]] = []
+    # 1) 위/아래 3줄까지 (접두어) 형태 탐색
+    for dist in range(1, 4):
+        for idx in [line_idx + dist, line_idx - dist]:
+            if 0 <= idx < len(lines):
+                ln = lines[idx].strip()
+                paren = re.search(r'\(([^)]+)\)', ln)
+                if paren:
+                    raw = paren.group(1)
+                    for variant in [raw, raw.replace(',', '.')]:
+                        candidate = '(' + variant + ')' + bare
+                        if candidate in master_set:
+                            return candidate
 
-    i = 0
-    while i < len(texts):
-        if i in consumed:
-            i += 1
-            continue
+    # 2) 접두어가 괄호 없이 순수명칭 앞에 직접 붙은 형태
+    for pfx in sorted_pfx:
+        if cur.startswith(pfx + bare):
+            candidate = '(' + pfx + ')' + bare
+            if candidate in master_set:
+                return candidate
 
-        loc_cur, txt_cur = texts[i]
-        stripped_cur = txt_cur.strip()
-
-        # 패턴 감지: "접두어" 다음에 이름 조각/연도가 분리된 경우
-        if stripped_cur in KNOWN_PREFIXES:
-            fragments, next_index = _collect_pdf_name_fragments(texts, i + 1)
-            merged_name = "".join(fragments).replace(" ", "")
-            can_merge = False
-            if merged_name.startswith(stripped_cur):
-                merged_name = merged_name[len(stripped_cur):]
-                can_merge = True
-            elif merged_name.startswith("년"):
-                year, year_index = _extract_pdf_detached_year(texts, next_index)
-                if year:
-                    merged_name = f"{year}{merged_name}"
-                    next_index = year_index
-                    can_merge = True
-
-            if can_merge and merged_name and len(merged_name) >= 4:
-                merged.append((loc_cur, f"({stripped_cur}){merged_name}"))
-                consumed.update(range(i + 1, next_index))
-                i = next_index
-                continue
-
-        # 패턴 감지: "(접두어)" 다음에 이름 조각이 1~3줄로 이어지는 경우
-        if stripped_cur.startswith("(") and stripped_cur.endswith(")"):
-            prefix = stripped_cur[1:-1].strip().replace(",", ".")
-            if prefix in KNOWN_PREFIXES:
-                fragments, next_index = _collect_pdf_name_fragments(texts, i + 1)
-                merged_name = "".join(fragments).replace(" ", "")
-                if merged_name and len(merged_name) >= 4:
-                    merged.append((loc_cur, f"({prefix}){merged_name}"))
-                    consumed.update(range(i + 1, next_index))
-                    i = next_index
-                    continue
-
-        # 패턴 감지: 현재 라인이 ")" + 한글/영문/숫자로 시작하는 경우
-        if (
-            len(txt_cur) >= 2
-            and txt_cur[0] == ')'
-            and i >= 2
-        ):
-            _, txt_prev1 = texts[i - 1]  # 바로 직전 라인
-            _, txt_prev2 = texts[i - 2]  # 2칸 위 라인
-
-            # 직전 라인이 "(" 이고, 2칸 위 라인 끝에 접두어 텍스트가 있는 경우
-            if txt_prev1.strip() == '(':
-                # 2칸 위 라인에서 접두어 추출: ": 종심", "- 대상\n: 종심" 등
-                # 콜론 뒤의 마지막 토큰을 접두어로 간주
-                prefix_text = ""
-                colon_match = re.search(r'[:：]\s*(\S+)\s*$', txt_prev2)
-                if colon_match:
-                    candidate = colon_match.group(1).strip()
-                    # KNOWN_PREFIXES에 포함되는지 확인
-                    if candidate in KNOWN_PREFIXES:
-                        prefix_text = candidate
-
-                if prefix_text:
-                    # 순수명칭: ")" 제거한 나머지
-                    bare_name = txt_cur[1:].strip()
-                    restored = f"({prefix_text}){bare_name}"
-
-                    # 2칸 위 라인에서 접두어 부분을 제거한 텍스트 복원
-                    cleaned_prev2 = txt_prev2[:colon_match.start(1)].rstrip()
-                    if cleaned_prev2 and cleaned_prev2 != texts[i - 2][1]:
-                        # 접두어만 제거된 앞부분이 남으면 유지
-                        merged.append((texts[i - 2][0], cleaned_prev2))
-                    consumed.add(i - 2)
-                    consumed.add(i - 1)  # "(" 라인 소비
-                    merged.append((loc_cur, restored))
-                    i += 1
-                    continue
-
-        if i not in consumed:
-            merged.append((loc_cur, txt_cur))
-        i += 1
-
-    # consumed에 포함되었지만 merged에서 대체되지 않은 항목 제거
-    # (이미 위 로직에서 처리되므로 추가 작업 불필요)
-
-    # ── 비괄호형 접두어 결합 복원 ──
-    # PyMuPDF 폴백에서 "접두어+명칭" 결합 형태가 나오는 문제를 보정한다.
-    sorted_prefixes = sorted(KNOWN_PREFIXES, key=len, reverse=True)
-    restored: list[tuple[str, str]] = []
-    for loc, txt in merged:
-        stripped = txt.strip()
-
-        # 이미 괄호형 접두어가 있으면 기존 값을 유지한다.
-        if stripped.startswith('('):
-            restored.append((loc, txt))
-            continue
-
-        # 특수기호를 제외한 본문에서 접두어를 긴 순서대로 매칭한다.
-        clean = stripped.lstrip(STRIP_CHARS).strip()
-        matched_prefix = ""
-        for pfx in sorted_prefixes:
-            if clean.startswith(pfx) and len(clean) > len(pfx):
-                matched_prefix = pfx
-                break
-
-        if matched_prefix:
-            bare_name = clean[len(matched_prefix):]
-            # 앞쪽 특수기호는 유지하고 접두어만 괄호형으로 복원한다.
-            leading = stripped[:len(stripped) - len(clean)]
-            restored_text = f"{leading}({matched_prefix}){bare_name}"
-            restored.append((loc, restored_text))
-        else:
-            restored.append((loc, txt))
-
-    return restored
-
-
-def _extract_pages_pdfplumber(
-    filepath: str,
-    total_pages: int,
-    timeout_per_page: float = 2.0,
-    page_nums: Optional[list[int]] = None,
-) -> dict[int, Optional[list[tuple[str, str]]]]:
-    """pdfplumber로 지정 페이지들을 추출한다. PDF는 한 번만 연다.
-
-    각 페이지 추출에 개별 타임아웃을 적용하며, 타임아웃 또는 오류 발생 시
-    해당 페이지는 ``None``으로 기록하여 호출측에서 폴백 처리하도록 한다.
-
-    Args:
-        filepath: PDF 파일 경로.
-        total_pages: 전체 페이지 수.
-        timeout_per_page: 페이지당 추출 타임아웃(초).
-        page_nums: 추출할 1-based 페이지 번호 목록. ``None``이면 전체 페이지.
-
-    Returns:
-        ``{페이지번호: [(위치, 텍스트), ...] 또는 None}`` 딕셔너리.
-    """
-    import pdfplumber
-
-    target_pages = sorted(
-        set(page_nums if page_nums is not None else range(1, total_pages + 1))
-    )
-    if not target_pages:
-        return {}
-
-    results: dict[int, Optional[list[tuple[str, str]]]] = {}
-
-    try:
-        pdf = pdfplumber.open(filepath)
-    except Exception:
-        # pdfplumber로 PDF를 열 수 없으면 전 페이지 None 반환
-        return {pg: None for pg in target_pages}
-
-    try:
-        for page_num in target_pages:
-            if page_num > len(pdf.pages):
-                results[page_num] = []
-                continue
-
-            page = pdf.pages[page_num - 1]
-
-            # 페이지별 타임아웃 처리
-            result_queue: "queue.Queue[tuple[str, object]]" = queue.Queue(maxsize=1)
-
-            def _worker(p=page, pn=page_num):
-                try:
-                    page_text = p.extract_text() or ""
-                    page_texts: list[tuple[str, str]] = []
-                    for line_num, line in enumerate(page_text.split('\n'), 1):
-                        line = line.strip()
-                        if line:
-                            page_texts.append((f"P{pn} L{line_num}", line))
-                    result_queue.put(("ok", page_texts))
-                except Exception:
-                    result_queue.put(("error", None))
-
-            worker = threading.Thread(target=_worker, daemon=True)
-            worker.start()
-            worker.join(timeout_per_page)
-
-            if worker.is_alive():
-                # 타임아웃 — 이 페이지는 폴백 대상
-                results[page_num] = None
-                continue
-
-            if result_queue.empty():
-                results[page_num] = None
-                continue
-
-            status, payload = result_queue.get_nowait()
-            if status == "ok" and payload is not None:
-                results[page_num] = payload  # type: ignore[assignment]
-            else:
-                results[page_num] = None
-    finally:
-        try:
-            pdf.close()
-        except Exception:
-            pass
-
-    return results
-
-
-def _extract_pages_pymupdf(
-    filepath: str,
-    page_nums: list[int],
-) -> dict[int, list[tuple[str, str]]]:
-    """PyMuPDF로 지정 페이지들의 텍스트를 추출한다. PDF는 한 번만 연다.
-
-    Args:
-        filepath: PDF 파일 경로.
-        page_nums: 1-based 페이지 번호 목록.
-
-    Returns:
-        ``{페이지번호: [(위치, 텍스트), ...]}`` 딕셔너리.
-    """
-    results: dict[int, list[tuple[str, str]]] = {}
-    if not page_nums:
-        return results
-
-    try:
-        import fitz
-    except ImportError:
-        return results
-
-    try:
-        doc = fitz.open(filepath)
-        try:
-            for page_num in page_nums:
-                if page_num - 1 >= len(doc):
-                    results[page_num] = []
-                    continue
-                page = doc[page_num - 1]
-                page_text = page.get_text()
-                lines: list[tuple[str, str]] = []
-                if page_text:
-                    for line_num, line in enumerate(page_text.split('\n'), 1):
-                        line = line.strip()
-                        if line:
-                            lines.append((f"P{page_num} L{line_num}", line))
-                results[page_num] = lines
-        finally:
-            doc.close()
-    except Exception:
-        pass
-
-    return results
-
-
-def _has_pdf_prefix_split(page_texts: list[tuple[str, str]]) -> bool:
-    """PyMuPDF 추출 결과에서 행분리 의심 패턴을 감지한다.
-
-    Args:
-        page_texts: 단일 페이지의 ``(위치, 텍스트)`` 목록.
-
-    Returns:
-        접두어/명칭이 다른 줄로 분리된 정황이 있으면 ``True``.
-    """
-    name_like_re = re.compile(r'[가-힣A-Za-z]')
-
-    for idx, (_, raw_text) in enumerate(page_texts):
-        line = str(raw_text).strip()
-        if not line:
-            continue
-
-        if line.startswith("(") and line.endswith(")"):
-            inner = line[1:-1].strip().replace(",", ".")
-            if inner in KNOWN_PREFIXES:
-                fragments, _ = _collect_pdf_name_fragments(page_texts, idx + 1)
-                merged_name = "".join(fragments).replace(" ", "")
-                if not merged_name or len(merged_name) < 4:
-                    return True
-                continue
-
-        if idx + 1 >= len(page_texts):
-            continue
-
-        next_line = str(page_texts[idx + 1][1]).strip()
-        if not next_line or not name_like_re.search(next_line):
-            continue
-
-        token = line.strip(STRIP_CHARS).strip()
-        normalized_token = token.strip("()").replace(",", ".")
-        if not normalized_token or len(normalized_token) >= 5:
-            continue
-
-        if (
-            normalized_token in KNOWN_PREFIXES
-            or (
-                len(normalized_token) >= 2
-                and any(prefix.startswith(normalized_token) for prefix in KNOWN_PREFIXES)
+    # 3) ')순수명칭' 형태 (접두어가 윗줄에 분리)
+    if cur.startswith(')') and bare in cur:
+        for back in range(1, min(5, line_idx + 1)):
+            combined = ''.join(
+                lines[line_idx - j].strip() for j in range(back, 0, -1)
             )
-        ):
-            fragments, next_index = _collect_pdf_name_fragments(page_texts, idx + 1)
-            if not fragments:
-                continue
+            for pfx in sorted_pfx:
+                if pfx in combined or pfx.replace('.', ',') in combined:
+                    candidate = '(' + pfx + ')' + bare
+                    if candidate in master_set:
+                        return candidate
 
-            merged_name = "".join(fragments).replace(" ", "")
-            if merged_name.startswith(normalized_token):
-                merged_name = merged_name[len(normalized_token):]
-                if merged_name and len(merged_name) >= 4:
-                    continue
-                return True
+    # 4) 현재 줄에서 (접두어)순수명칭 패턴 직접 탐색
+    paren_match = re.search(r'\(([^)]+)\)\s*' + re.escape(bare), cur)
+    if paren_match:
+        raw = paren_match.group(1)
+        for variant in [raw, raw.replace(',', '.')]:
+            candidate = '(' + variant + ')' + bare
+            if candidate in master_set:
+                return candidate
 
-            if merged_name.startswith("년"):
-                return True
-
-            return True
-
-    return False
+    return None
 
 
 def extract_from_pdf(filepath: str, progress_callback=None) -> list:
     """PDF 파일에서 줄 단위 텍스트를 추출한다.
 
-    PyMuPDF로 전체 페이지를 먼저 추출하고, 접두어/명칭 행분리가 의심되는
-    페이지와 PyMuPDF 실패 페이지만 pdfplumber로 보완한다.
-    최종 결과에 조각 병합 후처리를 적용한다.
+    pdfplumber를 우선 사용하고, 페이지 단위로 PyMuPDF(fitz)를 보완용으로 사용한다.
 
     Args:
-        filepath: ``.pdf`` 파일 경로.
+        filepath: .pdf 파일 경로.
         progress_callback: PDF 추출 단계 진행률 콜백(0.0~0.3 구간).
 
     Returns:
-        ``(위치, 텍스트)`` 튜플 목록.
+        (위치, 텍스트) 튜플 목록.
     """
     def _emit_progress(value: float):
         """PDF 추출 진행률 콜백을 안전하게 호출한다."""
@@ -496,80 +221,87 @@ def extract_from_pdf(filepath: str, progress_callback=None) -> list:
         except Exception:
             pass
 
-    # ── 페이지 수 확인 ──
-    total_pages = 0
+    texts: list[tuple[str, str]] = []
+
     try:
-        import fitz
-        doc = fitz.open(filepath)
-        total_pages = len(doc)
-        doc.close()
-    except ImportError:
         import pdfplumber
+
         with pdfplumber.open(filepath) as pdf:
             total_pages = len(pdf.pages)
+            if total_pages == 0:
+                return []
 
-    if total_pages == 0:
-        return []
+            fitz_doc = None
+            try:
+                import fitz
+                fitz_doc = fitz.open(filepath)
+            except Exception:
+                fitz_doc = None
 
-    all_pages = list(range(1, total_pages + 1))
+            try:
+                _emit_progress(0.05)
 
-    # ── 1단계: PyMuPDF 전체 추출 (빠른 기본 경로) ──
-    pymupdf_results = _extract_pages_pymupdf(filepath, all_pages)
-    _emit_progress(0.2)
+                for pg_idx, page in enumerate(pdf.pages):
+                    page_text = ""
+                    try:
+                        page_text = page.extract_text() or ""
+                    except Exception:
+                        page_text = ""
 
-    # PyMuPDF를 사용할 수 없거나 전체 실패한 경우에만 pdfplumber 전체 추출로 폴백한다.
-    if not pymupdf_results:
-        plumber_results = _extract_pages_pdfplumber(
-            filepath, total_pages, timeout_per_page=3.0
-        )
-        _emit_progress(0.27)
+                    if not page_text and fitz_doc is not None and pg_idx < len(fitz_doc):
+                        try:
+                            page_text = fitz_doc[pg_idx].get_text() or ""
+                        except Exception:
+                            page_text = ""
 
-        texts: list[tuple[str, str]] = []
-        for pg in all_pages:
-            texts.extend(plumber_results.get(pg) or [])
-            _emit_progress(0.27 + 0.03 * (pg / total_pages))
+                    if page_text:
+                        page_num = pg_idx + 1
+                        for line_num, line in enumerate(page_text.splitlines(), 1):
+                            stripped = line.strip()
+                            if stripped:
+                                location = f"P{page_num} L{line_num}"
+                                texts.append((location, stripped))
+
+                    _emit_progress(0.05 + 0.25 * ((pg_idx + 1) / total_pages))
+            finally:
+                if fitz_doc is not None:
+                    fitz_doc.close()
 
         _emit_progress(0.3)
-        return _merge_pdf_prefix_fragments(texts)
+        return texts
+    except Exception:
+        pass
 
-    suspicious_pages: list[int] = []
-    failed_pages: list[int] = []
-    for pg in all_pages:
-        page_data = pymupdf_results.get(pg)
-        if page_data is None:
-            failed_pages.append(pg)
-            continue
-        if _has_pdf_prefix_split(page_data):
-            suspicious_pages.append(pg)
+    try:
+        import fitz
+    except ImportError:
+        raise ImportError("pdfplumber/PyMuPDF 둘 다 사용할 수 없습니다. 관련 패키지를 설치해주세요.")
 
-    _emit_progress(0.23)
+    doc = fitz.open(filepath)
+    try:
+        total_pages = len(doc)
+        if total_pages == 0:
+            return []
 
-    # ── 2단계: 의심/실패 페이지만 pdfplumber 보완 ──
-    plumber_pages = sorted(set(suspicious_pages + failed_pages))
-    plumber_results: dict[int, Optional[list[tuple[str, str]]]] = {}
-    if plumber_pages:
-        plumber_results = _extract_pages_pdfplumber(
-            filepath,
-            total_pages,
-            timeout_per_page=3.0,
-            page_nums=plumber_pages,
-        )
-    _emit_progress(0.27)
+        _emit_progress(0.05)
+        for pg_idx in range(total_pages):
+            page = doc[pg_idx]
+            page_text = page.get_text()
+            page_num = pg_idx + 1
 
-    # ── 3단계: 결과 조립 ──
-    texts: list[tuple[str, str]] = []
-    for pg in all_pages:
-        page_data = pymupdf_results.get(pg, [])
-        plumber_page = plumber_results.get(pg)
-        if plumber_page is not None:
-            page_data = plumber_page
-        texts.extend(page_data)
-        # 페이지 조립 진행률은 0.27~0.30 구간으로 반영한다.
-        _emit_progress(0.27 + 0.03 * (pg / total_pages))
+            if page_text:
+                for line_num, line in enumerate(page_text.splitlines(), 1):
+                    stripped = line.strip()
+                    if stripped:
+                        location = f"P{page_num} L{line_num}"
+                        texts.append((location, stripped))
+
+            _emit_progress(0.05 + 0.25 * ((pg_idx + 1) / total_pages))
+    finally:
+        doc.close()
 
     _emit_progress(0.3)
-
-    return _merge_pdf_prefix_fragments(texts)
+    return texts
 
 
 def extract_from_docx(filepath: str) -> list:
@@ -804,7 +536,6 @@ def extract_text_from_file(
     Returns:
         `(위치, 텍스트)` 튜플 목록.
     """
-    # 향후 호환을 위해 인자는 유지한다.
     _ = include_pdf_tables
     ext = os.path.splitext(filepath)[1].lower()
     if ext == ".pdf":
@@ -929,20 +660,11 @@ def _normalize_known_prefix_punctuation(text: str) -> str:
 def strip_known_prefix(text: str) -> tuple[str, str]:
     """텍스트 앞에 붙은 알려진 접두어를 분리한다.
 
-    PDF 추출 시 "(종심)포항안동도로"가 "종심포항안동도로"로 합쳐지는
-    경우를 처리하기 위한 전처리 함수.
-
     Args:
         text: 검사 대상 문자열.
 
     Returns:
         `(접두어, 순수명칭)` 튜플. 접두어 미발견 시 `("", 원본)` 반환.
-
-    Examples:
-        "종심포항안동도로" -> ("종심", "포항안동도로")
-        "(종심)포항안동도로" -> ("종심", "포항안동도로")
-        "▶ 시행도급대전죽동오피스텔" -> ("시행도급", "대전죽동오피스텔")
-        "포항안동도로" -> ("", "포항안동도로")
     """
     raw = str(text or "")
     cleaned = raw.strip().strip(STRIP_CHARS).strip()
@@ -950,7 +672,6 @@ def strip_known_prefix(text: str) -> tuple[str, str]:
     if not cleaned:
         return "", ""
 
-    # 1) (접두어)명칭 형태 우선 분리
     pm = PREFIX_PATTERN.match(cleaned)
     if pm:
         prefix = pm.group(1).strip()
@@ -959,7 +680,6 @@ def strip_known_prefix(text: str) -> tuple[str, str]:
             return prefix, bare
         return "", cleaned
 
-    # 2) 괄호 없는 접두어는 긴 접두어부터 비교하여 오탐을 줄인다.
     for prefix in sorted(KNOWN_PREFIXES, key=len, reverse=True):
         if cleaned.startswith(prefix):
             bare = cleaned[len(prefix):].strip()
@@ -1177,6 +897,11 @@ DEFAULT_MASTER_NAMES = [
     "(도전)25년 창원지사TN",
     "(도전)25년 진주지사TN",
     "(민운)25년 서울춘천TN",
+    "(국운)26년 멧둔재TN",
+    "(BTO)화성오산고속화도로",
+    "(종심)가산가평천연가스",
+    "(민참.분양)하남교산A",
+    "(기본)여주시신청사",
 ]
 
 
@@ -1211,7 +936,7 @@ def get_last_master_load_error() -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-#  명칭 매칭 엔진 v3.0
+#  명칭 매칭 엔진 v3.2
 # ═══════════════════════════════════════════════════════════
 class NameMatcher:
     """공사명칭 후보를 마스터 DB와 비교해 판정한다."""
@@ -1225,7 +950,6 @@ class NameMatcher:
     }
 
     # 보고서에서 공사명 뒤에 붙는 노이즈 괄호 패턴
-    # (LH), (시공), (시행), (토목), (건축), (전기), (소방) 등
     NOISE_SUFFIX_RE = re.compile(
         r'\((?:LH|시공|시행|토목|건축|기계|조경|감리|설계|PM|발주|원청)\)$'
     )
@@ -1239,17 +963,14 @@ class NameMatcher:
         self.master_names = list(dict.fromkeys(master_names))
         self.master_set = set(self.master_names)
 
-        # 순수명칭 -> 공식명칭 리스트 인덱스(동일 순수명칭 다건 지원)
         self.bare_to_official = build_bare_name_index(self.master_names)
         self.bare_names = list(self.bare_to_official.keys())
         self.min_bare_length = min((len(name) for name in self.bare_names), default=0)
 
-        # 공식명칭별 접두어를 캐시해 접두어 분기 비교 비용을 줄인다.
         self.official_prefix = {
             official: split_official_name(official)[0] for official in self.master_names
         }
 
-        # 마스터 순수명칭에 존재하는 후미 괄호는 정규화 시 보존한다.
         self.master_suffixes = set()
         for bare in self.bare_names:
             suffix_match = re.search(r'\([^)]+\)$', bare)
@@ -1264,15 +985,7 @@ class NameMatcher:
 
     @staticmethod
     def _compile_alternation(items: list, with_token_boundary: bool = False):
-        """문자열 목록을 OR 정규식으로 컴파일한다.
-
-        Args:
-            items: 패턴으로 만들 문자열 목록.
-            with_token_boundary: 토큰 경계 보호 여부.
-
-        Returns:
-            컴파일된 정규식 객체.
-        """
+        """문자열 목록을 OR 정규식으로 컴파일한다."""
         escaped_items = [re.escape(item) for item in items if item]
         if not escaped_items:
             return re.compile(r"(?!x)x")
@@ -1285,44 +998,19 @@ class NameMatcher:
 
     @staticmethod
     def _remove_prefix(name: str) -> str:
-        """앞쪽 접두어를 제거한 순수명칭을 반환한다.
-
-        Deprecated: split_official_name()을 사용할 것.
-
-        Args:
-            name: 원본 문자열.
-
-        Returns:
-            접두어가 제거된 순수명칭.
-        """
+        """앞쪽 접두어를 제거한 순수명칭을 반환한다."""
         _, bare = split_official_name(name)
         return bare
 
     @staticmethod
     def _has_prefix(name: str) -> bool:
-        """문자열이 `(접두어)`로 시작하는지 확인한다.
-
-        Args:
-            name: 검사 대상 문자열.
-
-        Returns:
-            접두어 시작 여부.
-        """
+        """문자열이 `(접두어)`로 시작하는지 확인한다."""
         return bool(PREFIX_PATTERN.match(name.strip()))
 
     def _normalize(self, text: str) -> str:
-        """비교를 위해 텍스트를 정규화한다.
-
-        Args:
-            text: 원본 후보 문자열.
-
-        Returns:
-            접두어/노이즈 후미 괄호를 정리한 문자열.
-        """
-        # 인덱스 키 생성 경로와 조회 경로를 동일화하기 위해 split_official_name()을 사용한다.
+        """비교를 위해 텍스트를 정규화한다."""
         _, result = split_official_name(text.strip())
 
-        # 후미 괄호가 마스터에 없는 노이즈라면 제거한다.
         suffix_match = re.search(r'\([^)]+\)$', result)
         if suffix_match:
             suffix = suffix_match.group()
@@ -1332,14 +1020,7 @@ class NameMatcher:
         return result
 
     def _is_excluded(self, text: str) -> bool:
-        """후보 제외 대상 텍스트인지 판정한다.
-
-        Args:
-            text: 검사 대상 문자열.
-
-        Returns:
-            제외 대상 여부.
-        """
+        """후보 제외 대상 텍스트인지 판정한다."""
         clean = text.strip()
         if clean in self.EXCLUDE_WORDS:
             return True
@@ -1350,19 +1031,11 @@ class NameMatcher:
         return False
 
     def _find_containing_matches(self, normalized: str) -> list:
-        """포함 관계 기반 후보 공식명칭 목록을 찾는다.
-
-        Args:
-            normalized: 정규화된 입력 문자열.
-
-        Returns:
-            포함 관계가 성립한 공식명칭 목록.
-        """
+        """포함 관계 기반 후보 공식명칭 목록을 찾는다."""
         matches = []
         for bare, officials in self.bare_to_official.items():
             if len(bare) < 4 or len(normalized) < 4:
                 continue
-            # 접두어 누락/불완전 입력을 잡기 위해 양방향 포함을 허용한다.
             if bare.startswith(normalized) or normalized.startswith(bare):
                 for off in officials:
                     if off not in matches:
@@ -1371,15 +1044,7 @@ class NameMatcher:
 
     @staticmethod
     def _contains_bare_token(text: str, bare: str) -> bool:
-        """순수명칭이 독립 토큰으로 등장하는지 검사한다.
-
-        Args:
-            text: 검사 대상 문자열.
-            bare: 순수명칭.
-
-        Returns:
-            독립 토큰으로 존재하면 `True`.
-        """
+        """순수명칭이 독립 토큰으로 등장하는지 검사한다."""
         token_re = re.compile(
             rf'(?<![0-9A-Za-z가-힣]){re.escape(bare)}(?![0-9A-Za-z가-힣])'
         )
@@ -1387,15 +1052,7 @@ class NameMatcher:
 
     @staticmethod
     def _extract_prefixed_candidate(text: str, bare: str):
-        """텍스트에서 `(접두어)순수명칭` 형태 후보를 추출한다.
-
-        Args:
-            text: 원문 문자열.
-            bare: 순수명칭.
-
-        Returns:
-            원문 후보 문자열 또는 `None`.
-        """
+        """텍스트에서 `(접두어)순수명칭` 형태 후보를 추출한다."""
         prefixed_re = re.compile(
             rf'(\([^)]+\)\s*{re.escape(bare)})(?![0-9A-Za-z가-힣])'
         )
@@ -1406,16 +1063,7 @@ class NameMatcher:
 
     @staticmethod
     def _is_side_boundary(text: str, index: int, is_left: bool) -> bool:
-        """공식명칭 좌/우 경계가 정상인지 확인한다.
-
-        Args:
-            text: 원문 텍스트.
-            index: 경계 인덱스.
-            is_left: 왼쪽 경계 검사 여부.
-
-        Returns:
-            시작/끝 또는 공백 경계면 `True`.
-        """
+        """공식명칭 좌/우 경계가 정상인지 확인한다."""
         if is_left and index <= 0:
             return True
         if (not is_left) and index >= len(text):
@@ -1425,16 +1073,7 @@ class NameMatcher:
 
     @staticmethod
     def _build_warning_issue(front_ok: bool, back_ok: bool, official: str) -> str:
-        """경고 메시지를 규격화한다.
-
-        Args:
-            front_ok: 앞 경계 정상 여부.
-            back_ok: 뒤 경계 정상 여부.
-            official: 대응 공식명칭.
-
-        Returns:
-            경고 사유 문자열.
-        """
+        """경고 메시지를 규격화한다."""
         if not front_ok and not back_ok:
             side = "앞/뒤"
         elif not front_ok:
@@ -1444,23 +1083,25 @@ class NameMatcher:
         return f"경고: 명칭 {side} 부가문자 부착 → 공식: {official}"
 
     def _check_official_inclusion(self, text: str) -> Optional[dict]:
-        """공식명칭 직접 포함 여부와 경계를 함께 판정한다.
-
-        Args:
-            text: 검사 대상 문자열.
-
-        Returns:
-            일치/경고 판정 dict 또는 `None`.
-        """
+        """공식명칭 직접 포함 여부와 경계를 함께 판정한다."""
         warning_result = None
         for match in self._official_pattern.finditer(text):
             official = match.group(0)
             start, end = match.span()
             front_ok = self._is_side_boundary(text, start, is_left=True)
             back_ok = self._is_side_boundary(text, end, is_left=False)
+            normalized_front_ok = front_ok
+            normalized_back_ok = back_ok
 
-            # 공식명칭이 경계 포함으로 정확히 분리되면 즉시 통과 처리한다.
-            if front_ok and back_ok:
+            if not normalized_front_ok:
+                left_attached = _get_attached_side_segment(text, start, is_left=True)
+                normalized_front_ok = _strip_surrounding(left_attached) == ""
+
+            if not normalized_back_ok:
+                right_attached = _get_attached_side_segment(text, end, is_left=False)
+                normalized_back_ok = _strip_surrounding(right_attached) == ""
+
+            if normalized_front_ok and normalized_back_ok:
                 return {
                     "input": text,
                     "status": "일치",
@@ -1468,38 +1109,25 @@ class NameMatcher:
                     "issue": "",
                 }
 
-            # 앞/뒤에 문자가 붙어 있으면 경고로 기록한다.
             if warning_result is None:
                 warning_result = {
                     "input": text,
                     "status": "경고",
                     "suggestion": official,
-                    "issue": self._build_warning_issue(front_ok, back_ok, official),
+                    "issue": self._build_warning_issue(
+                        normalized_front_ok, normalized_back_ok, official
+                    ),
                 }
         return warning_result
 
     @staticmethod
     def _format_ambiguous_issue(candidates: list[str]) -> str:
-        """특정불가 사유 문자열을 포맷팅한다.
-
-        Args:
-            candidates: 유사 후보 공식명칭 목록.
-
-        Returns:
-            리포트 표기용 특정불가 사유 문자열.
-        """
+        """특정불가 사유 문자열을 포맷팅한다."""
         display = " ".join([f"{i + 1}. {name}" for i, name in enumerate(candidates)])
-        return f"특정불가 (유사 {len(candidates)}건): {display}"
+        return f"공사명 불일치: 특정불가 (유사 {len(candidates)}건): {display}"
 
     def find_all_in_text(self, text: str) -> list:
-        """텍스트에서 마스터DB와 연관된 후보 문자열을 찾는다.
-
-        Args:
-            text: 원문 텍스트.
-
-        Returns:
-            후보 문자열 목록.
-        """
+        """텍스트에서 마스터DB와 연관된 후보 문자열을 찾는다."""
         found = []
         text = text.strip()
         if len(text) < 3:
@@ -1507,26 +1135,22 @@ class NameMatcher:
         if self._is_excluded(text):
             return []
 
-        # (A) 전체 텍스트가 공식명칭/순수명칭과 동일한 경우
         if text in self.master_set:
             return [text]
         if text in self.bare_to_official:
             return [text]
 
-        # (B) 정규화 후 순수명칭이 맞으면 원문을 후보로 올린다.
         norm = self._normalize(text)
         if norm != text and norm in self.bare_to_official:
             return [text]
         if len(text) < self.min_bare_length:
             return []
 
-        # (C) 텍스트 안의 공식명칭 직접 포함 후보
         for match in self._official_pattern.finditer(text):
             official = match.group(0)
             if official not in found:
                 found.append(official)
 
-        # (D) 텍스트 안의 순수명칭 포함 후보
         for match in self._bare_pattern.finditer(text):
             bare = match.group(0)
             officials = self.bare_to_official.get(bare)
@@ -1537,7 +1161,6 @@ class NameMatcher:
             if already:
                 continue
 
-            # '(접두어)순수명칭'이 있으면 bare 단독 추가를 피하고 원문 후보 유지
             prefixed = self._extract_prefixed_candidate(text, bare)
             if prefixed:
                 if prefixed not in found:
@@ -1547,7 +1170,6 @@ class NameMatcher:
             if bare not in found:
                 found.append(bare)
 
-        # (E) 정규식으로 못 잡은 경우 포함/유사도 후보를 보조 탐색한다.
         if not found:
             containing = self._find_containing_matches(norm)
             if containing:
@@ -1560,14 +1182,7 @@ class NameMatcher:
         return found
 
     def _best_similarity(self, text: str):
-        """순수명칭 기준 최고 유사도 공식명칭을 찾는다.
-
-        Args:
-            text: 비교 대상 문자열.
-
-        Returns:
-            `(공식명칭, 유사도)` 튜플.
-        """
+        """순수명칭 기준 최고 유사도 공식명칭을 찾는다."""
         cached = self._similarity_cache.get(text)
         if cached is not None:
             return cached
@@ -1578,7 +1193,7 @@ class NameMatcher:
             score = SequenceMatcher(None, text, bare).ratio()
             if score > best_score:
                 best_score = score
-                best_name = officials[0]  # 대표 공식명칭
+                best_name = officials[0]
         result = (best_name, best_score)
         self._similarity_cache[text] = result
         return result
@@ -1586,11 +1201,16 @@ class NameMatcher:
     def check(self, text: str) -> dict:
         """단일 문자열을 마스터 명칭 규칙으로 판정한다.
 
+        판정 결과의 불일치 사유는 3가지 카테고리로 분류된다:
+        - 공사명 불일치: 순수명칭 자체가 다름
+        - 접두어(사업유형) 불일치: 순수명칭은 맞으나 접두어가 다름
+        - 연도 불일치: 접두어·공사명은 같고 연도만 다름
+
         Args:
             text: 검사 대상 문자열.
 
         Returns:
-            `{input, status, suggestion, issue}` 형태 dict 또는 `None`.
+            ``{input, status, suggestion, issue}`` 형태 dict 또는 ``None``.
         """
         text = str(text or "").strip()
         if not text or self._is_excluded(text):
@@ -1598,13 +1218,13 @@ class NameMatcher:
 
         match_text = _normalize_known_prefix_punctuation(text)
 
-        # STEP 1: 공식명칭 포함 + 경계 판정(통과/경고)
+        # ── STEP 1: 공식명칭 포함 + 경계 판정 (일치/경고) ──
         inclusion_result = self._check_official_inclusion(match_text)
         if inclusion_result:
             inclusion_result["input"] = text
             return inclusion_result
 
-        # STEP 2: 접두어 분리 매칭
+        # ── STEP 2: 접두어 분리 매칭 ──
         normalized = self._normalize(match_text)
         split_prefix, split_bare = strip_known_prefix(match_text)
         split_bare = split_bare or normalized
@@ -1626,7 +1246,7 @@ class NameMatcher:
                         "input": text,
                         "status": "불일치",
                         "suggestion": official,
-                        "issue": f"접두어 누락 → 공식: {official}",
+                        "issue": f"접두어(사업유형) 불일치: 접두어 누락 → 공식: {official}",
                     }
 
                 if split_prefix == official_prefix:
@@ -1634,14 +1254,17 @@ class NameMatcher:
                         "input": text,
                         "status": "불일치",
                         "suggestion": official,
-                        "issue": f"접두어 분리매칭 → 공식: {official}",
+                        "issue": f"접두어(사업유형) 불일치: 괄호 표기 누락 → 공식: {official}",
                     }
 
                 return {
                     "input": text,
                     "status": "불일치",
                     "suggestion": official,
-                    "issue": f"접두어 불일치 ({split_prefix}->{official_prefix}) → 공식: {official}",
+                    "issue": (
+                        f"접두어(사업유형) 불일치: "
+                        f"{split_prefix} → {official_prefix} → 공식: {official}"
+                    ),
                 }
 
             return {
@@ -1651,7 +1274,7 @@ class NameMatcher:
                 "issue": self._format_ambiguous_issue(officials),
             }
 
-        # 괄호 없는 "접두어+명칭" 형태는 접두어 분리 유사매칭을 우선 설명한다.
+        # 괄호 없는 "접두어+명칭" 형태의 유사 매칭
         if is_direct_prefix_form and len(split_bare) >= 4:
             best_split_name, best_split_score = self._best_similarity(split_bare)
             if (
@@ -1663,19 +1286,20 @@ class NameMatcher:
                     "input": text,
                     "status": "불일치",
                     "suggestion": best_split_name,
-                    "issue": f"접두어 분리매칭 → 공식: {best_split_name}",
+                    "issue": (
+                        f"접두어(사업유형) 불일치: "
+                        f"괄호 표기 누락 → 공식: {best_split_name}"
+                    ),
                 }
 
-        # STEP 3: 기존 포함 관계/유사도 비교
+        # ── STEP 3: 포함 관계 비교 ──
         containing = self._find_containing_matches(normalized)
         if containing:
             if len(containing) == 1:
-                # 포함 비교도 인덱스와 동일한 접두어 분리 경로를 사용한다.
                 _, candidate_bare = split_official_name(containing[0])
                 candidate_bare = candidate_bare.replace(" ", "")
                 compare_text = normalized.replace(" ", "")
 
-                # "공식명칭+1글자" 수준은 오탈자 가능성이 높아 유사도 단계로 넘긴다.
                 likely_typo = (
                     compare_text.startswith(candidate_bare)
                     and len(compare_text) - len(candidate_bare) <= 1
@@ -1685,7 +1309,7 @@ class NameMatcher:
                         "input": text,
                         "status": "불일치",
                         "suggestion": containing[0],
-                        "issue": f"명칭 불완전 → 공식: {containing[0]}",
+                        "issue": f"공사명 불일치: 명칭 불완전 → 공식: {containing[0]}",
                     }
             else:
                 return {
@@ -1695,17 +1319,42 @@ class NameMatcher:
                     "issue": self._format_ambiguous_issue(containing),
                 }
 
+        # ── STEP 4: 유사도 비교 ──
         best_name, best_score = self._best_similarity(normalized)
         if best_score >= 0.7:
+            _, best_bare = split_official_name(best_name)
+            best_prefix = self.official_prefix.get(best_name, "")
+
+            # 연도만 다른지 판별 (접두어 분리된 경우)
+            if (
+                split_prefix
+                and split_prefix == best_prefix
+                and _is_year_only_diff(split_bare, best_bare)
+            ):
+                return {
+                    "input": text,
+                    "status": "불일치",
+                    "suggestion": best_name,
+                    "issue": f"연도 불일치 → 유사: {best_name}",
+                }
+
+            # 연도만 다른지 판별 (정규화된 전체 비교)
+            if _is_year_only_diff(normalized, best_bare):
+                return {
+                    "input": text,
+                    "status": "불일치",
+                    "suggestion": best_name,
+                    "issue": f"연도 불일치 → 유사: {best_name}",
+                }
+
             pct = f"{best_score * 100:.0f}%"
             return {
                 "input": text,
                 "status": "불일치",
                 "suggestion": best_name,
-                "issue": f"오탈자 추정 (유사도 {pct}) → 공식: {best_name}",
+                "issue": f"공사명 불일치 (유사도 {pct}) → 유사: {best_name}",
             }
 
-        # 공사명으로 보기 어려운 텍스트는 결과 목록에서 제외한다.
         return None
 
 # ═══════════════════════════════════════════════════════════
@@ -1715,23 +1364,12 @@ class ReviewEngine:
     """파일 단위로 후보 명칭을 수집하고 판정 결과를 집계한다."""
 
     def __init__(self, matcher: NameMatcher):
-        """검토 엔진을 초기화한다.
-
-        Args:
-            matcher: 명칭 판정기 인스턴스.
-        """
+        """검토 엔진을 초기화한다."""
         self.matcher = matcher
 
     @staticmethod
     def _build_full_text_with_offsets(text_items: list) -> tuple[str, list, list]:
-        """텍스트 조각 목록을 단일 문자열과 오프셋 테이블로 변환한다.
-
-        Args:
-            text_items: `(위치, 텍스트)` 목록.
-
-        Returns:
-            `(결합문자열, 시작오프셋목록, 오프셋메타목록)` 튜플.
-        """
+        """텍스트 조각 목록을 단일 문자열과 오프셋 테이블로 변환한다."""
         parts = []
         starts = []
         offsets = []
@@ -1747,22 +1385,13 @@ class ReviewEngine:
             end = start + len(text)
             starts.append(start)
             offsets.append((start, end, location, text))
-            cursor = end + 1  # '\n'
+            cursor = end + 1
 
         return "\n".join(parts), starts, offsets
 
     @staticmethod
     def _find_offset_index(starts: list, offsets: list, position: int) -> int:
-        """결합 문자열 위치를 원본 조각 인덱스로 역매핑한다.
-
-        Args:
-            starts: 각 조각 시작 오프셋 목록.
-            offsets: 조각 메타 목록.
-            position: 결합 문자열 내 문자 위치.
-
-        Returns:
-            대응 조각 인덱스. 없으면 `-1`.
-        """
+        """결합 문자열 위치를 원본 조각 인덱스로 역매핑한다."""
         idx = bisect.bisect_right(starts, position) - 1
         if idx < 0 or idx >= len(offsets):
             return -1
@@ -1773,20 +1402,10 @@ class ReviewEngine:
 
     @staticmethod
     def _extend_official_candidate(source_text: str, start: int, end: int) -> str:
-        """공식명칭 주변 부착 문자를 포함한 후보를 생성한다.
-
-        Args:
-            source_text: 원본 줄 텍스트.
-            start: 공식명칭 시작 인덱스(줄 기준).
-            end: 공식명칭 끝 인덱스(줄 기준, exclusive).
-
-        Returns:
-            경계 부착 여부를 판정할 수 있도록 확장된 후보 문자열.
-        """
+        """공식명칭 주변 부착 문자를 포함한 후보를 생성한다."""
         left = start
         right = end
 
-        # 경고 판정을 위해 공백이 아닌 좌/우 1글자를 함께 포함한다.
         if left > 0 and not source_text[left - 1].isspace():
             left -= 1
         if right < len(source_text) and not source_text[right].isspace():
@@ -1794,17 +1413,8 @@ class ReviewEngine:
         return source_text[left:right].strip()
 
     def review_file(self, filepath: str, progress_callback=None) -> dict:
-        """단일 파일을 검토해 공사명칭 판정 결과를 반환한다.
-
-        Args:
-            filepath: 입력 파일 경로.
-            progress_callback: 파일 내부 진행률(0.0~1.0) 콜백.
-
-        Returns:
-            파일 단위 집계 결과 dict.
-        """
+        """단일 파일을 검토해 공사명칭 판정 결과를 반환한다."""
         def _emit_progress(value: float):
-            """진행률 콜백을 안전하게 호출한다."""
             if progress_callback is None:
                 return
             try:
@@ -1822,7 +1432,6 @@ class ReviewEngine:
             _emit_progress(0.3)
         except Exception as e:
             _emit_progress(1.0)
-            # 파일 파싱 실패는 전체 검토 결과를 오류 상태로 반환한다.
             return {
                 "file": filename, "path": filepath,
                 "total": 0, "matched": 0, "mismatched": 0, "warning": 0,
@@ -1834,7 +1443,6 @@ class ReviewEngine:
         checked_locations = {}
 
         def consume_candidate(candidate: str, location: str):
-            """후보를 판정하고 중복 결과를 병합한다."""
             if candidate in checked_results:
                 existing = checked_results[candidate]
                 locs = checked_locations[candidate]
@@ -1855,12 +1463,10 @@ class ReviewEngine:
         if full_text:
             match_events = []
             matched_offset_indices = set()
-            # 미검출 조각 보조 탐색 시 동일 텍스트 재평가를 피하기 위한 캐시.
             aux_candidate_cache: dict[str, list[str]] = {}
             has_korean_re = re.compile(r"[가-힣]")
             min_aux_length = self.matcher.min_bare_length * 0.5
 
-            # 공식명칭 직접 매칭은 경고 판정을 위해 좌/우 부착 문자를 포함한다.
             for match in self.matcher._official_pattern.finditer(full_text):
                 idx = self._find_offset_index(starts, offsets, match.start())
                 if idx < 0:
@@ -1872,7 +1478,6 @@ class ReviewEngine:
                 candidate = self._extend_official_candidate(source_text, local_start, local_end)
                 match_events.append((match.start(), 0, candidate, location))
 
-            # 순수명칭 매칭은 기존 방식 유지(접두어/유사도 단계로 연결).
             for match in self.matcher._bare_pattern.finditer(full_text):
                 idx = self._find_offset_index(starts, offsets, match.start())
                 if idx < 0:
@@ -1881,7 +1486,16 @@ class ReviewEngine:
                 _, _, location, source_text = offsets[idx]
                 bare = match.group(0)
                 prefixed = self.matcher._extract_prefixed_candidate(source_text, bare)
-                candidate = prefixed if prefixed else bare
+                if prefixed:
+                    candidate = prefixed
+                else:
+                    page_lines = full_text.splitlines()
+                    bare_line_idx = full_text[:match.start()].count("\n")
+                    reconstructed = _reconstruct_prefix(
+                        bare, page_lines, bare_line_idx,
+                        self.matcher.master_set, KNOWN_PREFIXES
+                    )
+                    candidate = reconstructed if reconstructed else bare
                 match_events.append((match.start(), 1, candidate, location))
 
             _emit_progress(0.6)
@@ -1890,7 +1504,6 @@ class ReviewEngine:
             for _, _, candidate, location in match_events:
                 consume_candidate(candidate, location)
 
-            # 정규식 미검출 조각에 대해서만 보조 탐색(포함/유사도)을 수행한다.
             unmatched_indices = [
                 idx for idx in range(len(offsets))
                 if idx not in matched_offset_indices
@@ -1908,19 +1521,14 @@ class ReviewEngine:
                 text = source_text.strip()
                 if len(text) > 80:
                     continue
-                # 1) 짧은 조각은 공사명 후보 가능성이 낮아 조기 제외한다.
                 if len(text) < 2:
                     continue
-                # 2) 라벨/헤더 등 제외 단어는 보조 탐색 대상에서 제외한다.
                 if text in self.matcher.EXCLUDE_WORDS:
                     continue
-                # 3) 한글이 없는 조각(숫자/영문 위주)은 탐색을 생략한다.
                 if not has_korean_re.search(text):
                     continue
-                # 4) 마스터 최소 순수명칭 길이 대비 과도하게 짧은 조각은 제외한다.
                 if min_aux_length > 0 and len(text) < min_aux_length:
                     continue
-                # 5) 공백이 포함된 문장형 텍스트는 보조 탐색 비용만 크므로 제외한다.
                 if " " in text and "(" not in text and ")" not in text:
                     continue
 
@@ -1936,7 +1544,6 @@ class ReviewEngine:
 
         matched = sum(1 for r in results if r["status"] == "일치")
         mismatched = sum(1 for r in results if r["status"] == "불일치")
-        # 경고/기타 상태를 warning 집계로 포함해 total 정합성을 보장한다.
         warnings = sum(
             1 for r in results if r["status"] not in {"일치", "불일치"}
         )
@@ -1949,6 +1556,14 @@ class ReviewEngine:
         else:
             overall = "검토필요"
 
+        def _sort_key(result: dict) -> tuple[int, int]:
+            loc = result.get("location", "")
+            match = re.match(r'P(\d+)\s*L(\d+)', loc)
+            if match:
+                return int(match.group(1)), int(match.group(2))
+            return (999999, 999999)
+
+        results.sort(key=_sort_key)
         _emit_progress(1.0)
         return {
             "file": filename, "path": filepath,
@@ -1963,17 +1578,10 @@ class ReviewEngine:
 # ═══════════════════════════════════════════════════════════
 def save_excel_report(all_results: list, output_path: str,
                       master_names: list):
-    """검토 결과를 Excel 리포트로 저장한다.
-
-    Args:
-        all_results: 파일별 검토 결과 목록.
-        output_path: 저장할 xlsx 경로.
-        master_names: 마스터 공식명칭 목록.
-    """
+    """검토 결과를 Excel 리포트로 저장한다."""
     from openpyxl import Workbook
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
-    # 헤더/본문 스타일 정의
     wb = Workbook()
     hdr_fill = PatternFill("solid", fgColor="2F5496")
     hdr_font = Font(color="FFFFFF", bold=True, size=11, name="맑은 고딕")
@@ -2030,14 +1638,13 @@ def save_excel_report(all_results: list, output_path: str,
             row += 1
             continue
 
-        # 불일치/경고만 표시(일치는 리포트에서 제외)
         ng_items = [
             d for d in fr["details"]
             if d["status"] in ("불일치", "경고")
         ]
 
         if not ng_items and not fr.get("error"):
-            continue  # 적합한 파일은 건너뛰기
+            continue
 
         for d in ng_items:
             ws.cell(row=row, column=1, value=fr["file"]).font = bfont
@@ -2046,7 +1653,6 @@ def save_excel_report(all_results: list, output_path: str,
             c3 = ws.cell(row=row, column=3, value=d["input"])
             c3.font = bfont
 
-            # 경고는 노랑, 불일치는 빨강으로 강조한다.
             if d["status"] == "경고":
                 c3.fill = warn_fill
             else:
@@ -2063,7 +1669,6 @@ def save_excel_report(all_results: list, output_path: str,
     for letter, w in zip('ABCDE', [30, 18, 35, 40, 55]):
         ws.column_dimensions[letter].width = w
 
-    # 마스터 목록 시트
     ws2 = wb.create_sheet("마스터목록")
     for ci, h in enumerate(["No.", "공식 명칭", "접두어", "순수 명칭"], 1):
         cell = ws2.cell(row=1, column=ci, value=h)
@@ -2092,16 +1697,7 @@ def generate_highlight_snapshots(
     ng_items: list[dict],
     scale: float = 2.0,
 ) -> list[tuple[int, bytes]]:
-    """PDF 파일에서 불일치 위치를 하이라이트한 페이지 이미지를 생성한다.
-
-    Args:
-        filepath: PDF 파일 경로.
-        ng_items: 불일치 항목 목록(``{"input": str, "location": str, ...}``).
-        scale: 이미지 렌더링 배율(기본 2배).
-
-    Returns:
-        ``(페이지번호, PNG바이트)`` 튜플 목록. 생성 실패 시 빈 목록.
-    """
+    """PDF 파일에서 불일치 위치를 하이라이트한 페이지 이미지를 생성한다."""
     try:
         import fitz
     except ImportError:
@@ -2110,7 +1706,6 @@ def generate_highlight_snapshots(
     if os.path.splitext(filepath)[1].lower() != ".pdf":
         return []
 
-    # ── 페이지별 검색어 수집 ──
     page_targets: dict[int, list[str]] = {}
     for item in ng_items:
         location = item.get("location", "")
@@ -2119,13 +1714,9 @@ def generate_highlight_snapshots(
             continue
         page_num = int(m.group(1))
 
-        # 입력 텍스트에서 순수명칭만 추출한다.
         raw = item.get("input", "").strip()
-        # 1단계: 앞쪽 특수기호 제거 (▶, ■ 등)
         cleaned = raw.lstrip(STRIP_CHARS).strip()
-        # 2단계: 접두어 제거 → 순수명칭 추출
         _, bare = split_official_name(cleaned)
-        # 순수명칭이 비어있으면 정제된 원문 사용
         search_base = bare if bare else cleaned
         if not search_base or len(search_base) < 2:
             continue
@@ -2144,29 +1735,24 @@ def generate_highlight_snapshots(
                     continue
                 page = doc[page_num - 1]
                 targets = page_targets[page_num]
-                highlighted = False  # 이 페이지에 하이라이트가 있는지 추적
+                highlighted = False
 
                 for search_text in targets:
                     rects = []
 
-                    # 1차: 순수명칭 전체 검색
                     rects = page.search_for(search_text)
 
-                    # 2차: 앞 4글자 폴백 (한글 기준)
                     if not rects and len(search_text) >= 4:
                         rects = page.search_for(search_text[:4])
 
-                    # 3차: 앞 3글자 폴백
                     if not rects and len(search_text) >= 3:
                         rects = page.search_for(search_text[:3])
 
-                    # draw_rect로 직접 그려 get_pixmap()에 반영한다.
                     for rect in rects:
                         expanded = fitz.Rect(
                             rect.x0 - 2, rect.y0 - 2,
                             rect.x1 + 20, rect.y1 + 2
                         )
-                        # 노란 반투명 배경 + 빨간 테두리
                         page.draw_rect(
                             expanded,
                             color=(1, 0, 0),
@@ -2176,7 +1762,6 @@ def generate_highlight_snapshots(
                         )
                         highlighted = True
 
-                # 하이라이트가 있는 페이지만 스냅샷에 포함한다.
                 if highlighted:
                     pix = page.get_pixmap(matrix=mat)
                     results.append((page_num, pix.tobytes("png")))
