@@ -37,6 +37,9 @@ PDF_POOL_WORKERS = max(4, min(_CPU_COUNT // 2, 8))
 # 마지막 마스터 로드 실패 사유(서버 동기화 실패 메시지 보관)
 _LAST_MASTER_LOAD_ERROR = ""
 
+# filepath -> {page_num -> {line_num -> (x0, top, bottom)}}
+_PDF_FIRST_CHAR_COORDS: dict[str, dict[int, dict[int, tuple[float, float, float]]]] = {}
+
 # Google Sheets CSV export 등에서 내려오는 헤더 행 후보
 MASTER_NAME_HEADERS = {"공사약식명", "공사명", "공사명칭"}
 
@@ -150,24 +153,93 @@ def _extract_single_page_pdfplumber(args):
         args: `(filepath, page_num)` 튜플. `page_num`은 1-based.
 
     Returns:
-        `(page_num, [(위치, 텍스트), ...])` 튜플.
+        `(page_num, [(위치, 텍스트), ...], {line_num: (x0, top, bottom)})` 튜플.
+        좌표는 순수명칭(접두어 제거 후)의 첫 한글/영문/숫자 글자 기준이다.
     """
     filepath, page_num = args
     import pdfplumber
 
+    _search_char_re = re.compile(r'[가-힣a-zA-Z0-9]')
+
     results = []
+    first_char_coords: dict[int, tuple[float, float, float]] = {}
     try:
         with pdfplumber.open(filepath) as pdf:
             page_idx = page_num - 1
             if 0 <= page_idx < len(pdf.pages):
-                page_text = pdf.pages[page_idx].extract_text() or ""
-                for line_num, line in enumerate(page_text.splitlines(), 1):
+                page = pdf.pages[page_idx]
+                page_text = page.extract_text() or ""
+
+                lines = page_text.splitlines()
+                for line_num, line in enumerate(lines, 1):
                     stripped = line.strip()
                     if stripped:
                         results.append((f"P{page_num} L{line_num}", stripped))
+
+                chars = page.chars
+                if not chars:
+                    return page_num, results, first_char_coords
+
+                char_idx = 0
+                for line_num, line in enumerate(lines, 1):
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+
+                    # 접두어를 제거하여 순수명칭의 시작 위치를 파악한다.
+                    _, bare = strip_known_prefix(stripped)
+                    if not bare:
+                        bare = stripped
+
+                    # 순수명칭에서 첫 한글/영문/숫자 글자를 추출한다.
+                    m = _search_char_re.search(bare)
+                    if not m:
+                        continue
+                    target_char = m.group(0)
+
+                    # bare 앞 3글자(한글/영문/숫자만)를 연속 매칭 검증용으로 수집한다.
+                    verify_chars = []
+                    for ch in bare:
+                        if _search_char_re.match(ch):
+                            verify_chars.append(ch)
+                            if len(verify_chars) >= 3:
+                                break
+
+                    # chars 배열에서 target_char를 찾되, 후속 글자 연속 매칭으로 검증한다.
+                    best_i = None
+                    best_score = 0
+                    for i in range(char_idx, len(chars)):
+                        if chars[i]["text"] != target_char:
+                            continue
+
+                        score = 1
+                        for offset, expected in enumerate(verify_chars[1:], 1):
+                            ni = i + offset
+                            if ni < len(chars) and chars[ni]["text"] == expected:
+                                score += 1
+                            else:
+                                break
+
+                        if score > best_score:
+                            best_score = score
+                            best_i = i
+
+                        # 3글자 모두 매칭되면 확정
+                        if best_score >= len(verify_chars):
+                            break
+
+                    if best_i is not None:
+                        c = chars[best_i]
+                        first_char_coords[line_num] = (
+                            float(c["x0"]),
+                            float(c["top"]),
+                            float(c["bottom"]),
+                        )
+                        char_idx = best_i + 1
+
     except Exception:
         pass
-    return page_num, results
+    return page_num, results, first_char_coords
 
 
 def _reconstruct_prefix(bare: str, lines: list, line_idx: int,
@@ -252,6 +324,7 @@ def extract_from_pdf(filepath: str, progress_callback=None) -> list:
             pass
 
     texts: list[tuple[str, str]] = []
+    _PDF_FIRST_CHAR_COORDS[filepath] = {}
 
     try:
         import pdfplumber
@@ -271,12 +344,16 @@ def extract_from_pdf(filepath: str, progress_callback=None) -> list:
             page_results.sort(key=lambda item: item[0])
 
             parallel_texts: list[tuple[str, str]] = []
-            for page_num, lines in page_results:
+            coords_by_page: dict[int, dict[int, tuple[float, float, float]]] = {}
+            for page_num, lines, first_char_coords in page_results:
                 parallel_texts.extend(lines)
+                if first_char_coords:
+                    coords_by_page[page_num] = first_char_coords
                 _emit_progress(0.05 + 0.25 * (page_num / total_pages))
 
             _emit_progress(0.3)
             if parallel_texts:
+                _PDF_FIRST_CHAR_COORDS[filepath] = coords_by_page
                 return parallel_texts
         except Exception:
             pass
@@ -1759,59 +1836,87 @@ def generate_highlight_snapshots(
     ng_items: list[dict],
     resolution: int = 250,
 ) -> list[tuple[int, bytes]]:
-    """PDF 파일에서 불일치 위치를 하이라이트한 페이지 이미지를 생성한다."""
+    """PDF 파일에서 불일치 위치를 하이라이트한 페이지 이미지를 생성한다.
+
+    PyMuPDF로 순수명칭(접두어 제거)을 페이지에서 직접 검색하여
+    좌표를 확보하고, 해당 위치에 하이라이트 박스를 그린다.
+    """
     try:
         import io
-        import pdfplumber
+        import fitz
     except ImportError:
         return []
 
     if os.path.splitext(filepath)[1].lower() != ".pdf":
         return []
 
-    page_keywords: dict[int, list[str]] = {}
+    page_targets: dict[int, list[dict]] = {}
     for item in ng_items:
         location = item.get("location", "")
-        keyword = str(item.get("input", "")).lstrip(STRIP_CHARS).strip()
-        if not keyword:
+        if not location:
             continue
-        for page_str in re.findall(r'P(\d+)', location or ""):
+        for page_str in re.findall(r'P(\d+)', location):
             page_num = int(page_str)
-            page_keywords.setdefault(page_num, [])
-            if keyword not in page_keywords[page_num]:
-                page_keywords[page_num].append(keyword)
+            page_targets.setdefault(page_num, [])
+            if item not in page_targets[page_num]:
+                page_targets[page_num].append(item)
 
-    if not page_keywords:
+    if not page_targets:
         return []
+
+    dpi_scale = resolution / 72.0
+    mat = fitz.Matrix(dpi_scale, dpi_scale)
 
     results: list[tuple[int, bytes]] = []
     try:
-        with pdfplumber.open(filepath) as pdf:
-            for page_num in sorted(page_keywords.keys()):
+        doc = fitz.open(filepath)
+        try:
+            for page_num in sorted(page_targets.keys()):
                 page_idx = page_num - 1
-                if page_idx >= len(pdf.pages):
+                if page_idx >= len(doc):
                     continue
-                page = pdf.pages[page_idx]
-                img = page.to_image(resolution=resolution)
 
-                for keyword in page_keywords[page_num]:
-                    found = page.search(keyword, regex=False)
-                    for match in found:
-                        x0 = match["x0"]
-                        top = match["top"]
-                        x1 = match["x1"]
-                        bottom = match["bottom"]
-                        pad = max(2.0, (bottom - top) * 0.3)
-                        img.draw_rect(
-                            (x0 - pad, top - pad, x1 + pad, bottom + pad),
-                            stroke="red",
-                            stroke_width=2,
-                            fill=(255, 255, 0, 80),
-                        )
+                page = doc[page_idx]
+                pix = page.get_pixmap(matrix=mat)
+                img_bytes = pix.tobytes("png")
 
-                buf = io.BytesIO()
-                img.annotated.save(buf, format="PNG")
-                results.append((page_num, buf.getvalue()))
+                from PIL import Image, ImageDraw
+                pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                draw = ImageDraw.Draw(pil_img)
+                drew_any = False
+
+                for item in page_targets[page_num]:
+                    raw_input = item.get("input", "") or ""
+                    raw_input = raw_input.strip().strip(STRIP_CHARS).strip()
+                    _, bare = strip_known_prefix(raw_input)
+                    if not bare:
+                        bare = raw_input
+                    if not bare or len(bare) < 2:
+                        continue
+
+                    rects = page.search_for(bare)
+                    if not rects:
+                        tokens = bare.split()
+                        if len(tokens) > 1:
+                            rects = page.search_for(tokens[0])
+
+                    for rect in rects:
+                        x0 = rect.x0 * dpi_scale
+                        y0 = rect.y0 * dpi_scale
+                        x1 = rect.x1 * dpi_scale
+                        y1 = rect.y1 * dpi_scale
+                        pad = (y1 - y0) * 0.15
+                        box = (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+                        draw.rectangle(box, outline="red", width=3)
+                        drew_any = True
+
+                if drew_any:
+                    buf = io.BytesIO()
+                    pil_img.save(buf, format="PNG")
+                    results.append((page_num, buf.getvalue()))
+
+        finally:
+            doc.close()
     except Exception:
         pass
 
