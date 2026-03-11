@@ -34,9 +34,6 @@ from typing import Optional
 _CPU_COUNT = os.cpu_count() or 4
 PDF_POOL_WORKERS = max(4, min(_CPU_COUNT // 2, 8))
 
-# filepath -> {page_num -> {line_num -> (x0, y0, x1, y1)}}
-_PDF_LINE_BBOXES: dict[str, dict[int, dict[int, tuple[float, float, float, float]]]] = {}
-
 # 마지막 마스터 로드 실패 사유(서버 동기화 실패 메시지 보관)
 _LAST_MASTER_LOAD_ERROR = ""
 
@@ -153,81 +150,24 @@ def _extract_single_page_pdfplumber(args):
         args: `(filepath, page_num)` 튜플. `page_num`은 1-based.
 
     Returns:
-        `(page_num, [(위치, 텍스트), ...], {line_num: bbox})` 튜플.
+        `(page_num, [(위치, 텍스트), ...])` 튜플.
     """
     filepath, page_num = args
     import pdfplumber
 
     results = []
-    line_bboxes: dict[int, tuple[float, float, float, float]] = {}
     try:
         with pdfplumber.open(filepath) as pdf:
             page_idx = page_num - 1
             if 0 <= page_idx < len(pdf.pages):
-                page = pdf.pages[page_idx]
-                page_text = page.extract_text() or ""
-                chars = []
-                for ch in page.chars:
-                    text = str(ch.get("text", ""))
-                    top = ch.get("top")
-                    bottom = ch.get("bottom")
-                    x0 = ch.get("x0")
-                    x1 = ch.get("x1")
-                    if not text or top is None or bottom is None or x0 is None or x1 is None:
-                        continue
-                    if not text.strip():
-                        continue
-                    chars.append(ch)
-
-                chars.sort(key=lambda ch: (float(ch["top"]), float(ch["x0"])))
-                used = [False] * len(chars)
-                search_start = 0
+                page_text = pdf.pages[page_idx].extract_text() or ""
                 for line_num, line in enumerate(page_text.splitlines(), 1):
                     stripped = line.strip()
                     if stripped:
                         results.append((f"P{page_num} L{line_num}", stripped))
-                        first_char = next((ch for ch in stripped if not ch.isspace()), "")
-                        if not first_char or not chars:
-                            continue
-
-                        match_idx = None
-                        for idx in range(search_start, len(chars)):
-                            if used[idx]:
-                                continue
-                            if str(chars[idx].get("text", "")).strip() == first_char:
-                                match_idx = idx
-                                break
-                        if match_idx is None:
-                            for idx in range(0, search_start):
-                                if used[idx]:
-                                    continue
-                                if str(chars[idx].get("text", "")).strip() == first_char:
-                                    match_idx = idx
-                                    break
-                        if match_idx is None:
-                            continue
-
-                        anchor_top = float(chars[match_idx]["top"])
-                        matched_line_chars = []
-                        for idx, ch in enumerate(chars):
-                            if used[idx]:
-                                continue
-                            if abs(float(ch["top"]) - anchor_top) <= 3.0:
-                                matched_line_chars.append(ch)
-                                used[idx] = True
-
-                        if not matched_line_chars:
-                            continue
-
-                        x0 = min(float(ch["x0"]) for ch in matched_line_chars)
-                        y0 = min(float(ch["top"]) for ch in matched_line_chars)
-                        x1 = max(float(ch["x1"]) for ch in matched_line_chars)
-                        y1 = max(float(ch["bottom"]) for ch in matched_line_chars)
-                        line_bboxes[line_num] = (x0, y0, x1, y1)
-                        search_start = match_idx + 1
     except Exception:
         pass
-    return page_num, results, line_bboxes
+    return page_num, results
 
 
 def _reconstruct_prefix(bare: str, lines: list, line_idx: int,
@@ -294,8 +234,6 @@ def _reconstruct_prefix(bare: str, lines: list, line_idx: int,
 def extract_from_pdf(filepath: str, progress_callback=None) -> list:
     """PDF 파일에서 줄 단위 텍스트를 추출한다.
 
-    pdfplumber를 우선 사용하고, 페이지 단위로 PyMuPDF(fitz)를 보완용으로 사용한다.
-
     Args:
         filepath: .pdf 파일 경로.
         progress_callback: PDF 추출 단계 진행률 콜백(0.0~0.3 구간).
@@ -314,7 +252,6 @@ def extract_from_pdf(filepath: str, progress_callback=None) -> list:
             pass
 
     texts: list[tuple[str, str]] = []
-    _PDF_LINE_BBOXES[filepath] = {}
 
     try:
         import pdfplumber
@@ -334,16 +271,12 @@ def extract_from_pdf(filepath: str, progress_callback=None) -> list:
             page_results.sort(key=lambda item: item[0])
 
             parallel_texts: list[tuple[str, str]] = []
-            line_bboxes_by_page: dict[int, dict[int, tuple[float, float, float, float]]] = {}
-            for page_num, lines, line_bboxes in page_results:
+            for page_num, lines in page_results:
                 parallel_texts.extend(lines)
-                if line_bboxes:
-                    line_bboxes_by_page[page_num] = line_bboxes
                 _emit_progress(0.05 + 0.25 * (page_num / total_pages))
 
             _emit_progress(0.3)
             if parallel_texts:
-                _PDF_LINE_BBOXES[filepath] = line_bboxes_by_page
                 return parallel_texts
         except Exception:
             pass
@@ -353,7 +286,7 @@ def extract_from_pdf(filepath: str, progress_callback=None) -> list:
     try:
         import fitz
     except ImportError:
-        raise ImportError("pdfplumber/PyMuPDF 둘 다 사용할 수 없습니다. 관련 패키지를 설치해주세요.")
+        raise ImportError("pdfplumber/PyMuPDF 둘 다 사용할 수 없습니다.")
 
     doc = fitz.open(filepath)
     try:
@@ -1827,24 +1760,6 @@ def generate_highlight_snapshots(
     resolution: int = 250,
 ) -> list[tuple[int, bytes]]:
     """PDF 파일에서 불일치 위치를 하이라이트한 페이지 이미지를 생성한다."""
-    def _parse_locations(location_text: str) -> dict[int, list[int]]:
-        """위치 문자열에서 페이지별 줄 번호 목록을 추출한다."""
-        grouped: dict[int, list[int]] = {}
-        for page_str, line_str in re.findall(r'P(\d+)\s*L(\d+)', location_text or ""):
-            page_num = int(page_str)
-            line_num = int(line_str)
-            grouped.setdefault(page_num, [])
-            if line_num not in grouped[page_num]:
-                grouped[page_num].append(line_num)
-
-        if grouped:
-            return grouped
-
-        page_match = re.search(r'P(\d+)', location_text or "")
-        if page_match:
-            grouped[int(page_match.group(1))] = []
-        return grouped
-
     try:
         import io
         import pdfplumber
@@ -1854,59 +1769,45 @@ def generate_highlight_snapshots(
     if os.path.splitext(filepath)[1].lower() != ".pdf":
         return []
 
-    bbox_pages = _PDF_LINE_BBOXES.get(filepath, {})
-    page_targets: dict[int, list[tuple[int, str]]] = {}
+    page_keywords: dict[int, list[str]] = {}
     for item in ng_items:
         location = item.get("location", "")
-        location_map = _parse_locations(location)
-        if not location_map:
-            continue
-
         keyword = str(item.get("input", "")).lstrip(STRIP_CHARS).strip()
-        for page_num, line_nums in location_map.items():
-            page_targets.setdefault(page_num, [])
-            for line_num in line_nums:
-                if keyword:
-                    page_targets[page_num].append((line_num, keyword))
+        if not keyword:
+            continue
+        for page_str in re.findall(r'P(\d+)', location or ""):
+            page_num = int(page_str)
+            page_keywords.setdefault(page_num, [])
+            if keyword not in page_keywords[page_num]:
+                page_keywords[page_num].append(keyword)
 
-    if not page_targets:
+    if not page_keywords:
         return []
 
     results: list[tuple[int, bytes]] = []
     try:
         with pdfplumber.open(filepath) as pdf:
-            for page_num in sorted(page_targets.keys()):
+            for page_num in sorted(page_keywords.keys()):
                 page_idx = page_num - 1
                 if page_idx >= len(pdf.pages):
                     continue
                 page = pdf.pages[page_idx]
-                targets = page_targets[page_num]
-                line_bboxes = bbox_pages.get(page_num, {})
                 img = page.to_image(resolution=resolution)
 
-                for line_num, keyword in targets:
-                    line_bbox = line_bboxes.get(line_num)
-                    if not line_bbox:
-                        continue
-                    keyword_len = len(keyword)
-                    if keyword_len <= 0:
-                        continue
-                    x0, y0, x1, y1 = line_bbox
-                    char_h = max(1.0, y1 - y0)
-                    char_w = char_h * 1.0
-                    box_w = keyword_len * char_w
-                    box_x0 = x0
-                    box_y0 = y0
-                    box_x1 = x0 + box_w
-                    box_y1 = y1
-                    pad = char_h * 0.5
-                    padded = (box_x0 - pad, box_y0 - pad, box_x1 + pad, box_y1 + pad)
-                    img.draw_rect(
-                        padded,
-                        stroke="red",
-                        stroke_width=2,
-                        fill=(255, 255, 0, 80),
-                    )
+                for keyword in page_keywords[page_num]:
+                    found = page.search(keyword, regex=False)
+                    for match in found:
+                        x0 = match["x0"]
+                        top = match["top"]
+                        x1 = match["x1"]
+                        bottom = match["bottom"]
+                        pad = max(2.0, (bottom - top) * 0.3)
+                        img.draw_rect(
+                            (x0 - pad, top - pad, x1 + pad, bottom + pad),
+                            stroke="red",
+                            stroke_width=2,
+                            fill=(255, 255, 0, 80),
+                        )
 
                 buf = io.BytesIO()
                 img.annotated.save(buf, format="PNG")
