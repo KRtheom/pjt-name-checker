@@ -25,13 +25,17 @@ import re
 import bisect
 import queue
 import threading
-from multiprocessing import Pool
+from multiprocessing import Pool, freeze_support
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Optional
 
 # PDF 병렬 추출 워커 수 (CPU 코어 기반, 최대 8)
-PDF_POOL_WORKERS = max(4, min(os.cpu_count() // 2 or 4, 8))
+_CPU_COUNT = os.cpu_count() or 4
+PDF_POOL_WORKERS = max(4, min(_CPU_COUNT // 2, 8))
+
+# filepath -> {page_num -> {line_num -> (x0, y0, x1, y1)}}
+_PDF_LINE_BBOXES: dict[str, dict[int, dict[int, tuple[float, float, float, float]]]] = {}
 
 # 마지막 마스터 로드 실패 사유(서버 동기화 실패 메시지 보관)
 _LAST_MASTER_LOAD_ERROR = ""
@@ -149,24 +153,81 @@ def _extract_single_page_pdfplumber(args):
         args: `(filepath, page_num)` 튜플. `page_num`은 1-based.
 
     Returns:
-        `(page_num, [(위치, 텍스트), ...])` 튜플.
+        `(page_num, [(위치, 텍스트), ...], {line_num: bbox})` 튜플.
     """
     filepath, page_num = args
     import pdfplumber
 
     results = []
+    line_bboxes: dict[int, tuple[float, float, float, float]] = {}
     try:
         with pdfplumber.open(filepath) as pdf:
             page_idx = page_num - 1
             if 0 <= page_idx < len(pdf.pages):
-                page_text = pdf.pages[page_idx].extract_text() or ""
+                page = pdf.pages[page_idx]
+                page_text = page.extract_text() or ""
+                chars = []
+                for ch in page.chars:
+                    text = str(ch.get("text", ""))
+                    top = ch.get("top")
+                    bottom = ch.get("bottom")
+                    x0 = ch.get("x0")
+                    x1 = ch.get("x1")
+                    if not text or top is None or bottom is None or x0 is None or x1 is None:
+                        continue
+                    if not text.strip():
+                        continue
+                    chars.append(ch)
+
+                chars.sort(key=lambda ch: (float(ch["top"]), float(ch["x0"])))
+                used = [False] * len(chars)
+                search_start = 0
                 for line_num, line in enumerate(page_text.splitlines(), 1):
                     stripped = line.strip()
                     if stripped:
                         results.append((f"P{page_num} L{line_num}", stripped))
+                        first_char = next((ch for ch in stripped if not ch.isspace()), "")
+                        if not first_char or not chars:
+                            continue
+
+                        match_idx = None
+                        for idx in range(search_start, len(chars)):
+                            if used[idx]:
+                                continue
+                            if str(chars[idx].get("text", "")).strip() == first_char:
+                                match_idx = idx
+                                break
+                        if match_idx is None:
+                            for idx in range(0, search_start):
+                                if used[idx]:
+                                    continue
+                                if str(chars[idx].get("text", "")).strip() == first_char:
+                                    match_idx = idx
+                                    break
+                        if match_idx is None:
+                            continue
+
+                        anchor_top = float(chars[match_idx]["top"])
+                        matched_line_chars = []
+                        for idx, ch in enumerate(chars):
+                            if used[idx]:
+                                continue
+                            if abs(float(ch["top"]) - anchor_top) <= 3.0:
+                                matched_line_chars.append(ch)
+                                used[idx] = True
+
+                        if not matched_line_chars:
+                            continue
+
+                        x0 = min(float(ch["x0"]) for ch in matched_line_chars)
+                        y0 = min(float(ch["top"]) for ch in matched_line_chars)
+                        x1 = max(float(ch["x1"]) for ch in matched_line_chars)
+                        y1 = max(float(ch["bottom"]) for ch in matched_line_chars)
+                        line_bboxes[line_num] = (x0, y0, x1, y1)
+                        search_start = match_idx + 1
     except Exception:
         pass
-    return page_num, results
+    return page_num, results, line_bboxes
 
 
 def _reconstruct_prefix(bare: str, lines: list, line_idx: int,
@@ -253,6 +314,7 @@ def extract_from_pdf(filepath: str, progress_callback=None) -> list:
             pass
 
     texts: list[tuple[str, str]] = []
+    _PDF_LINE_BBOXES[filepath] = {}
 
     try:
         import pdfplumber
@@ -272,12 +334,16 @@ def extract_from_pdf(filepath: str, progress_callback=None) -> list:
             page_results.sort(key=lambda item: item[0])
 
             parallel_texts: list[tuple[str, str]] = []
-            for page_num, lines in page_results:
+            line_bboxes_by_page: dict[int, dict[int, tuple[float, float, float, float]]] = {}
+            for page_num, lines, line_bboxes in page_results:
                 parallel_texts.extend(lines)
+                if line_bboxes:
+                    line_bboxes_by_page[page_num] = line_bboxes
                 _emit_progress(0.05 + 0.25 * (page_num / total_pages))
 
             _emit_progress(0.3)
             if parallel_texts:
+                _PDF_LINE_BBOXES[filepath] = line_bboxes_by_page
                 return parallel_texts
         except Exception:
             pass
@@ -994,6 +1060,10 @@ class NameMatcher:
         self._bare_pattern = self._compile_alternation(sorted_bares, with_token_boundary=True)
         self._official_pattern = self._compile_alternation(sorted_officials)
         self._similarity_cache = {}
+        self._bare_prefix_index: dict[str, list[str]] = {}
+        for bare in self.bare_names:
+            if len(bare) >= 2:
+                self._bare_prefix_index.setdefault(bare[:2], []).append(bare)
 
     @staticmethod
     def _compile_alternation(items: list, with_token_boundary: bool = False):
@@ -1083,60 +1153,32 @@ class NameMatcher:
         ch = text[index - 1] if is_left else text[index]
         return ch.isspace()
 
-    @staticmethod
-    def _build_warning_issue(front_ok: bool, back_ok: bool, official: str) -> str:
-        """경고 메시지를 규격화한다."""
-        if not front_ok and not back_ok:
-            side = "앞/뒤"
-        elif not front_ok:
-            side = "앞"
-        else:
-            side = "뒤"
-        return f"경고: 명칭 {side} 부가문자 부착 → 공식: {official}"
-
     def _check_official_inclusion(self, text: str) -> Optional[dict]:
-        """공식명칭 직접 포함 여부와 경계를 함께 판정한다."""
-        warning_result = None
+        """공식명칭이 텍스트에 직접 포함되면 일치로 판정한다."""
         for match in self._official_pattern.finditer(text):
             official = match.group(0)
-            start, end = match.span()
-            front_ok = self._is_side_boundary(text, start, is_left=True)
-            back_ok = self._is_side_boundary(text, end, is_left=False)
-            normalized_front_ok = front_ok
-            normalized_back_ok = back_ok
-
-            if not normalized_front_ok:
-                left_attached = _get_attached_side_segment(text, start, is_left=True)
-                normalized_front_ok = _strip_surrounding(left_attached) == ""
-
-            if not normalized_back_ok:
-                right_attached = _get_attached_side_segment(text, end, is_left=False)
-                normalized_back_ok = _strip_surrounding(right_attached) == ""
-
-            if normalized_front_ok and normalized_back_ok:
-                return {
-                    "input": text,
-                    "status": "일치",
-                    "suggestion": official,
-                    "issue": "",
-                }
-
-            if warning_result is None:
-                warning_result = {
-                    "input": text,
-                    "status": "경고",
-                    "suggestion": official,
-                    "issue": self._build_warning_issue(
-                        normalized_front_ok, normalized_back_ok, official
-                    ),
-                }
-        return warning_result
+            return {
+                "input": text,
+                "status": "일치",
+                "suggestion": official,
+                "issue": "",
+            }
+        return None
 
     @staticmethod
     def _format_ambiguous_issue(candidates: list[str]) -> str:
         """특정불가 사유 문자열을 포맷팅한다."""
-        display = " ".join([f"{i + 1}. {name}" for i, name in enumerate(candidates)])
-        return f"공사명 불일치: 특정불가 (유사 {len(candidates)}건): {display}"
+        return f"공사명 불일치: 특정불가 (유사 {len(candidates)}건)"
+
+    @staticmethod
+    def _build_ambiguous_result(text: str, candidates: list[str]) -> dict:
+        """특정불가 후보들을 하나의 결과 행으로 변환한다."""
+        return {
+            "input": text,
+            "status": "불일치",
+            "suggestion": " / ".join(candidates),
+            "issue": NameMatcher._format_ambiguous_issue(candidates),
+        }
 
     def find_all_in_text(self, text: str) -> list:
         """텍스트에서 마스터DB와 연관된 후보 문자열을 찾는다."""
@@ -1201,16 +1243,34 @@ class NameMatcher:
 
         best_name = None
         best_score = 0.0
-        for bare, officials in self.bare_to_official.items():
-            score = SequenceMatcher(None, text, bare).ratio()
-            if score > best_score:
-                best_score = score
-                best_name = officials[0]
+
+        candidates = []
+        if len(text) >= 2:
+            candidates = self._bare_prefix_index.get(text[:2], [])
+        if not candidates and len(text) >= 1:
+            for key, bares in self._bare_prefix_index.items():
+                if key and key[0] == text[0]:
+                    candidates.extend(bares)
+
+        if candidates:
+            for bare in candidates:
+                score = SequenceMatcher(None, text, bare).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_name = self.bare_to_official.get(bare, [None])[0]
+
+        if best_score < 0.7:
+            for bare, officials in self.bare_to_official.items():
+                score = SequenceMatcher(None, text, bare).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_name = officials[0]
+
         result = (best_name, best_score)
         self._similarity_cache[text] = result
         return result
 
-    def check(self, text: str) -> dict:
+    def match(self, text: str) -> Optional[dict]:
         """단일 문자열을 마스터 명칭 규칙으로 판정한다.
 
         판정 결과의 불일치 사유는 3가지 카테고리로 분류된다:
@@ -1230,7 +1290,7 @@ class NameMatcher:
 
         match_text = _normalize_known_prefix_punctuation(text)
 
-        # ── STEP 1: 공식명칭 포함 + 경계 판정 (일치/경고) ──
+        # ── STEP 1: 공식명칭 포함 판정 (일치) ──
         inclusion_result = self._check_official_inclusion(match_text)
         if inclusion_result:
             inclusion_result["input"] = text
@@ -1279,12 +1339,7 @@ class NameMatcher:
                     ),
                 }
 
-            return {
-                "input": text,
-                "status": "불일치",
-                "suggestion": " / ".join(officials),
-                "issue": self._format_ambiguous_issue(officials),
-            }
+            return self._build_ambiguous_result(text, officials)
 
         # 괄호 없는 "접두어+명칭" 형태의 유사 매칭
         if is_direct_prefix_form and len(split_bare) >= 4:
@@ -1324,12 +1379,7 @@ class NameMatcher:
                         "issue": f"공사명 불일치: 명칭 불완전 → 공식: {containing[0]}",
                     }
             else:
-                return {
-                    "input": text,
-                    "status": "불일치",
-                    "suggestion": " / ".join(containing),
-                    "issue": self._format_ambiguous_issue(containing),
-                }
+                return self._build_ambiguous_result(text, containing)
 
         # ── STEP 4: 유사도 비교 ──
         best_name, best_score = self._best_similarity(normalized)
@@ -1368,6 +1418,10 @@ class NameMatcher:
             }
 
         return None
+
+    def check(self, text: str):
+        """단일 문자열을 마스터 명칭 규칙으로 판정한다."""
+        return self.match(text)
 
 # ═══════════════════════════════════════════════════════════
 #  검토 엔진
@@ -1424,6 +1478,12 @@ class ReviewEngine:
             right += 1
         return source_text[left:right].strip()
 
+    @staticmethod
+    def _iter_aux_candidates(text: str) -> list[str]:
+        """보조 탐색용 후보 문자열을 생성한다."""
+        primary = _strip_surrounding(text)
+        return [primary] if primary else []
+
     def review_file(self, filepath: str, progress_callback=None) -> dict:
         """단일 파일을 검토해 공사명칭 판정 결과를 반환한다."""
         def _emit_progress(value: float):
@@ -1451,33 +1511,57 @@ class ReviewEngine:
             }
 
         results = []
-        checked_results = {}
-        checked_locations = {}
+        checked_results: dict[tuple[str, str, str, str], dict] = {}
+        checked_locations: dict[tuple[str, str, str, str], list[str]] = {}
+
+        def _location_scope_key(location: str) -> str:
+            """결과 병합용 위치 범위를 계산한다."""
+            page_match = re.search(r'P(\d+)', location or "")
+            if page_match:
+                return f"P{page_match.group(1)}"
+            return str(location or "")
 
         def consume_candidate(candidate: str, location: str):
-            if candidate in checked_results:
-                existing = checked_results[candidate]
-                locs = checked_locations[candidate]
-                if location not in locs:
-                    locs.append(location)
-                    existing["location"] = ", ".join(locs)
+            match_result = self.matcher.match(candidate)
+            if not match_result:
                 return
 
-            check_result = self.matcher.check(candidate)
-            if check_result is None:
-                return
-            check_result["location"] = location
-            results.append(check_result)
-            checked_results[candidate] = check_result
-            checked_locations[candidate] = [location]
+            if isinstance(match_result, list):
+                match_results = match_result
+            else:
+                match_results = [match_result]
+
+            for match_item in match_results:
+                key = (
+                    _location_scope_key(location),
+                    match_item.get("input", candidate),
+                    match_item.get("status", ""),
+                    match_item.get("suggestion", ""),
+                )
+
+                if key in checked_results:
+                    existing = checked_results[key]
+                    locs = checked_locations[key]
+                    if location not in locs:
+                        locs.append(location)
+                        existing["location"] = ", ".join(locs)
+                    continue
+
+                stored_result = dict(match_item)
+                stored_result["location"] = location
+                results.append(stored_result)
+                checked_results[key] = stored_result
+                checked_locations[key] = [location]
 
         full_text, starts, offsets = self._build_full_text_with_offsets(text_items)
         if full_text:
             match_events = []
             matched_offset_indices = set()
             aux_candidate_cache: dict[str, list[str]] = {}
+            prefix_cache: dict[str, Optional[str]] = {}
             has_korean_re = re.compile(r"[가-힣]")
             min_aux_length = self.matcher.min_bare_length * 0.5
+            page_lines = full_text.splitlines()
 
             for match in self.matcher._official_pattern.finditer(full_text):
                 idx = self._find_offset_index(starts, offsets, match.start())
@@ -1501,12 +1585,16 @@ class ReviewEngine:
                 if prefixed:
                     candidate = prefixed
                 else:
-                    page_lines = full_text.splitlines()
                     bare_line_idx = full_text[:match.start()].count("\n")
-                    reconstructed = _reconstruct_prefix(
-                        bare, page_lines, bare_line_idx,
-                        self.matcher.master_set, KNOWN_PREFIXES
-                    )
+                    cache_key = f"{bare}|{bare_line_idx}"
+                    if cache_key in prefix_cache:
+                        reconstructed = prefix_cache[cache_key]
+                    else:
+                        reconstructed = _reconstruct_prefix(
+                            bare, page_lines, bare_line_idx,
+                            self.matcher.master_set, KNOWN_PREFIXES
+                        )
+                        prefix_cache[cache_key] = reconstructed
                     candidate = reconstructed if reconstructed else bare
                 match_events.append((match.start(), 1, candidate, location))
 
@@ -1541,16 +1629,45 @@ class ReviewEngine:
                     continue
                 if min_aux_length > 0 and len(text) < min_aux_length:
                     continue
-                if " " in text and "(" not in text and ")" not in text:
+
+                consumed_probe = False
+                for probe_text in self._iter_aux_candidates(text):
+                    if min_aux_length > 0 and len(probe_text) < min_aux_length:
+                        continue
+                    if probe_text in self.matcher.EXCLUDE_WORDS:
+                        continue
+                    if not has_korean_re.search(probe_text):
+                        continue
+
+                    cached_candidates = aux_candidate_cache.get(probe_text)
+                    if cached_candidates is None:
+                        cached_candidates = self.matcher.find_all_in_text(probe_text)
+                        aux_candidate_cache[probe_text] = cached_candidates
+
+                    for candidate in cached_candidates:
+                        consume_candidate(candidate, location)
+                        consumed_probe = True
+
+                if consumed_probe or "(" in text or ")" in text:
                     continue
 
-                cached_candidates = aux_candidate_cache.get(text)
-                if cached_candidates is None:
-                    cached_candidates = self.matcher.find_all_in_text(text)
-                    aux_candidate_cache[text] = cached_candidates
+                parts = text.split()
+                if not parts:
+                    continue
+                lead = _strip_surrounding(parts[0])
+                if min_aux_length > 0 and len(lead) < min_aux_length:
+                    continue
+                if lead in self.matcher.EXCLUDE_WORDS:
+                    continue
+                if not has_korean_re.search(lead):
+                    continue
 
-                for candidate in cached_candidates:
-                    consume_candidate(candidate, location)
+                lead_result = self.matcher.match(lead)
+                if (
+                    lead_result
+                    and "특정불가" in str(lead_result.get("issue", ""))
+                ):
+                    consume_candidate(lead, location)
         else:
             _emit_progress(0.6)
 
@@ -1707,78 +1824,93 @@ def save_excel_report(all_results: list, output_path: str,
 def generate_highlight_snapshots(
     filepath: str,
     ng_items: list[dict],
-    scale: float = 2.0,
+    resolution: int = 250,
 ) -> list[tuple[int, bytes]]:
     """PDF 파일에서 불일치 위치를 하이라이트한 페이지 이미지를 생성한다."""
+    def _parse_locations(location_text: str) -> dict[int, list[int]]:
+        """위치 문자열에서 페이지별 줄 번호 목록을 추출한다."""
+        grouped: dict[int, list[int]] = {}
+        for page_str, line_str in re.findall(r'P(\d+)\s*L(\d+)', location_text or ""):
+            page_num = int(page_str)
+            line_num = int(line_str)
+            grouped.setdefault(page_num, [])
+            if line_num not in grouped[page_num]:
+                grouped[page_num].append(line_num)
+
+        if grouped:
+            return grouped
+
+        page_match = re.search(r'P(\d+)', location_text or "")
+        if page_match:
+            grouped[int(page_match.group(1))] = []
+        return grouped
+
     try:
-        import fitz
+        import io
+        import pdfplumber
     except ImportError:
         return []
 
     if os.path.splitext(filepath)[1].lower() != ".pdf":
         return []
 
-    page_targets: dict[int, list[str]] = {}
+    bbox_pages = _PDF_LINE_BBOXES.get(filepath, {})
+    page_targets: dict[int, list[tuple[int, str]]] = {}
     for item in ng_items:
         location = item.get("location", "")
-        m = re.match(r'P(\d+)', location)
-        if not m:
+        location_map = _parse_locations(location)
+        if not location_map:
             continue
-        page_num = int(m.group(1))
 
-        raw = item.get("input", "").strip()
-        cleaned = raw.lstrip(STRIP_CHARS).strip()
-        _, bare = split_official_name(cleaned)
-        search_base = bare if bare else cleaned
-        if not search_base or len(search_base) < 2:
-            continue
-        page_targets.setdefault(page_num, []).append(search_base)
+        keyword = str(item.get("input", "")).lstrip(STRIP_CHARS).strip()
+        for page_num, line_nums in location_map.items():
+            page_targets.setdefault(page_num, [])
+            for line_num in line_nums:
+                if keyword:
+                    page_targets[page_num].append((line_num, keyword))
 
     if not page_targets:
         return []
 
     results: list[tuple[int, bytes]] = []
     try:
-        doc = fitz.open(filepath)
-        try:
-            mat = fitz.Matrix(scale, scale)
+        with pdfplumber.open(filepath) as pdf:
             for page_num in sorted(page_targets.keys()):
-                if page_num - 1 >= len(doc):
+                page_idx = page_num - 1
+                if page_idx >= len(pdf.pages):
                     continue
-                page = doc[page_num - 1]
+                page = pdf.pages[page_idx]
                 targets = page_targets[page_num]
-                highlighted = False
+                line_bboxes = bbox_pages.get(page_num, {})
+                img = page.to_image(resolution=resolution)
 
-                for search_text in targets:
-                    rects = []
+                for line_num, keyword in targets:
+                    line_bbox = line_bboxes.get(line_num)
+                    if not line_bbox:
+                        continue
+                    keyword_len = len(keyword)
+                    if keyword_len <= 0:
+                        continue
+                    x0, y0, x1, y1 = line_bbox
+                    char_h = max(1.0, y1 - y0)
+                    char_w = char_h * 1.0
+                    box_w = keyword_len * char_w
+                    box_x0 = x0
+                    box_y0 = y0
+                    box_x1 = x0 + box_w
+                    box_y1 = y1
+                    pad = char_h * 0.5
+                    padded = (box_x0 - pad, box_y0 - pad, box_x1 + pad, box_y1 + pad)
+                    img.draw_rect(
+                        padded,
+                        stroke="red",
+                        stroke_width=2,
+                        fill=(255, 255, 0, 80),
+                    )
 
-                    rects = page.search_for(search_text)
-
-                    if not rects and len(search_text) >= 4:
-                        rects = page.search_for(search_text[:4])
-
-                    if not rects and len(search_text) >= 3:
-                        rects = page.search_for(search_text[:3])
-
-                    for rect in rects:
-                        expanded = fitz.Rect(
-                            rect.x0 - 2, rect.y0 - 2,
-                            rect.x1 + 20, rect.y1 + 2
-                        )
-                        page.draw_rect(
-                            expanded,
-                            color=(1, 0, 0),
-                            width=2,
-                            fill=(1, 1, 0),
-                            fill_opacity=0.3,
-                        )
-                        highlighted = True
-
-                if highlighted:
-                    pix = page.get_pixmap(matrix=mat)
-                    results.append((page_num, pix.tobytes("png")))
-        finally:
-            doc.close()
+                buf = io.BytesIO()
+                img.annotated.save(buf, format="PNG")
+                results.append((page_num, buf.getvalue()))
     except Exception:
         pass
 

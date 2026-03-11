@@ -408,16 +408,9 @@ class App(ctk.CTk):
             return
         count = len(self.master_names)
         if self.is_server_synced:
-            if self.db_date:
-                try:
-                    date_text = datetime.strptime(self.db_date, "%Y-%m-%d").strftime("%y/%m/%d")
-                except ValueError:
-                    date_text = self.db_date
-                text = f"DB서버 : {count}개(동기성공-{date_text}기점)"
-            else:
-                text = f"DB서버 : {count}개(동기성공)"
+            text = f"{count}개(동기성공)"
         else:
-            text = f"DB서버 : {count}개(동기실패)"
+            text = f"{count}개(동기실패)"
         self.db_source_label.configure(text=text)
 
     def _build_drop_hint(self, parent):
@@ -669,7 +662,20 @@ class App(ctk.CTk):
                     )
                     self._log(f"  │   사유: {reason}")
                     if official:
-                        self._log(f"  │   공식: {official}")
+                        if "특정불가" in item.get("issue", ""):
+                            candidates = [
+                                part.strip()
+                                for part in official.split(" / ")
+                                if part.strip()
+                            ]
+                            if candidates:
+                                self._log(f"  │   후보: {candidates[0]}")
+                                for candidate_name in candidates[1:]:
+                                    self._log(f"  │         {candidate_name}")
+                            else:
+                                self._log(f"  │   후보: {official}")
+                        else:
+                            self._log(f"  │   공식: {official}")
 
                     connector = "└" if i == len(items) - 1 else "├"
                     self._log(f"  {connector}{bar}")
@@ -1039,7 +1045,11 @@ class App(ctk.CTk):
 
         popup = ctk.CTkToplevel(self)
         popup.title("불일치 스냅샷 보기")
-        popup.geometry("900x700")
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        win_w = min(int(screen_w * 0.9), 1600)
+        win_h = min(int(screen_h * 0.9), 1000)
+        popup.geometry(f"{win_w}x{win_h}")
         popup.grab_set()
         self._apply_icon_to_toplevel(popup)
 
@@ -1088,16 +1098,21 @@ class App(ctk.CTk):
             ).pack(pady=(12, 4), anchor="w")
 
             pil_image = Image.open(io.BytesIO(png_bytes))
-            max_width = 860
-            if pil_image.width > max_width:
-                ratio = max_width / pil_image.width
-                new_size = (max_width, int(pil_image.height * ratio))
-                pil_image = pil_image.resize(new_size, Image.LANCZOS)
+            scale = 0.5
+            new_w = max(1, int(pil_image.width * scale))
+            new_h = max(1, int(pil_image.height * scale))
+            max_width = win_w - 40
+            if new_w > max_width:
+                ratio = max_width / new_w
+                new_w = max_width
+                new_h = max(1, int(new_h * ratio))
+
+            pil_image = pil_image.resize((new_w, new_h), Image.LANCZOS)
 
             ctk_image = ctk.CTkImage(
                 light_image=pil_image,
                 dark_image=pil_image,
-                size=(pil_image.width, pil_image.height)
+                size=(new_w, new_h)
             )
             popup._snapshot_images.append(ctk_image)
 
