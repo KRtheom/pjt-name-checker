@@ -1838,8 +1838,10 @@ def generate_highlight_snapshots(
 ) -> list[tuple[int, bytes]]:
     """PDF 파일에서 불일치 위치를 하이라이트한 페이지 이미지를 생성한다.
 
-    PyMuPDF로 순수명칭(접두어 제거)을 페이지에서 직접 검색하여
+    PyMuPDF로 순수명칭(접두어·연도 제거)을 페이지에서 직접 검색하여
     좌표를 확보하고, 해당 위치에 하이라이트 박스를 그린다.
+    전체 키워드 검색 실패 시 한글만 추출하여 재검색한다.
+    한글 검색 시 접두어·영문·숫자 영역을 포함하도록 좌우 패딩을 확장한다.
     """
     try:
         import io
@@ -1864,6 +1866,17 @@ def generate_highlight_snapshots(
     if not page_targets:
         return []
 
+    _year_prefix_re = re.compile(r'^\d{2,4}\s*년\s*')
+
+    def _get_search_keyword(item: dict) -> str:
+        raw_input = item.get("input", "") or ""
+        raw_input = raw_input.strip().strip(STRIP_CHARS).strip()
+        _, bare = strip_known_prefix(raw_input)
+        if not bare:
+            bare = raw_input
+        bare = _year_prefix_re.sub("", bare).strip()
+        return bare
+
     dpi_scale = resolution / 72.0
     mat = fitz.Matrix(dpi_scale, dpi_scale)
 
@@ -1886,27 +1899,37 @@ def generate_highlight_snapshots(
                 drew_any = False
 
                 for item in page_targets[page_num]:
-                    raw_input = item.get("input", "") or ""
-                    raw_input = raw_input.strip().strip(STRIP_CHARS).strip()
-                    _, bare = strip_known_prefix(raw_input)
-                    if not bare:
-                        bare = raw_input
-                    if not bare or len(bare) < 2:
+                    keyword = _get_search_keyword(item)
+                    if not keyword or len(keyword) < 2:
                         continue
 
-                    rects = page.search_for(bare)
+                    used_hangul_fallback = False
+                    rects = page.search_for(keyword)
+
                     if not rects:
-                        tokens = bare.split()
-                        if len(tokens) > 1:
-                            rects = page.search_for(tokens[0])
+                        hangul_only = re.sub(r'[^가-힣]', '', keyword)
+                        if hangul_only and len(hangul_only) >= 2:
+                            rects = page.search_for(hangul_only)
+                            if rects:
+                                used_hangul_fallback = True
 
                     for rect in rects:
                         x0 = rect.x0 * dpi_scale
                         y0 = rect.y0 * dpi_scale
                         x1 = rect.x1 * dpi_scale
                         y1 = rect.y1 * dpi_scale
-                        pad = (y1 - y0) * 0.15
-                        box = (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+                        char_h = y1 - y0
+                        pad_y = char_h * 0.15
+
+                        if used_hangul_fallback:
+                            pad_left = char_h * 2.5
+                            pad_right = char_h * 1.5
+                        else:
+                            pad_left = char_h * 0.5
+                            pad_right = char_h * 0.5
+
+                        box = (x0 - pad_left, y0 - pad_y,
+                               x1 + pad_right, y1 + pad_y)
                         draw.rectangle(box, outline="red", width=3)
                         drew_any = True
 
