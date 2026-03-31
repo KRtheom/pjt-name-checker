@@ -1336,6 +1336,18 @@ class NameMatcher:
         _cleaned_bare = _cleaned_bare.strip()
         if _cleaned_bare and _cleaned_bare != split_bare:
             split_bare = _cleaned_bare
+        # ★ trailing 숫자-하이픈-퍼센트 노이즈 제거 (예: "서산씨지앤대산천연가스63---0.0%")
+        if split_bare not in self.bare_to_official:
+            _noise_cleaned = re.sub(r'\d[\d\-\.,%]*$', '', split_bare).strip()
+            if _noise_cleaned and _noise_cleaned != split_bare:
+                if _noise_cleaned in self.bare_to_official:
+                    split_bare = _noise_cleaned
+                else:
+                    _noise_ns = _noise_cleaned.replace(" ", "")
+                    for master_bare in self.bare_to_official:
+                        if master_bare.replace(" ", "") == _noise_ns:
+                            split_bare = master_bare
+                            break    
         stripped_input = match_text.strip().strip(STRIP_CHARS).strip()
         is_direct_prefix_form = (
             bool(split_prefix)
