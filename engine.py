@@ -1258,13 +1258,24 @@ class NameMatcher:
                 found.append(bare)
 
         if not found:
+            # ★ 부가정보 정제: 괄호+숫자/금액, 대괄호, trailing 노이즈 제거
+            cleaned = text
+            cleaned = re.sub(r'\([^)]*\d[^)]*\)', '', cleaned)
+            cleaned = re.sub(r'\([^)]*(?:조정|증액|감액|변경|추가)[^)]*\)', '', cleaned)
+            cleaned = re.sub(r'\[[^\]]*\]', '', cleaned)
+            cleaned = re.sub(r'\d+[억원조만%]+.*$', '', cleaned)
+            cleaned = re.sub(r'\d[\d\-\.,%]*$', '', cleaned)
+            cleaned = re.sub(r'^[^가-힣a-zA-Z0-9(]+', '', cleaned)
+            cleaned = cleaned.strip()
+            candidate = cleaned if cleaned and cleaned != text else text
+
             containing = self._find_containing_matches(norm)
             if containing:
-                return [text]
+                return [candidate]
 
             best_name, best_score = self._best_similarity(norm)
             if best_score >= 0.7:
-                return [text]
+                return [candidate]
 
         return found
 
