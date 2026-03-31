@@ -721,6 +721,34 @@ def _decode_master_csv_text(raw: bytes) -> str:
             continue
     return raw.decode("utf-8", errors="replace")
 
+def _collapse_spaced_text(text: str) -> str:
+    """PDF 추출 시 글자마다 공백이 들어간 텍스트를 복원한다.
+
+    '(시 행 도 급 )성 남 복 정 3 B L' → '(시행도급)성남복정3BL'
+    일반 문장(공백이 의미 있는 경우)은 건드리지 않는다.
+    """
+    if not text or len(text) < 4:
+        return text
+
+    # 공백 제거 버전
+    collapsed = text.replace(" ", "")
+    if collapsed == text:
+        return text  # 공백 없으면 그대로
+
+    # "글자 공백 글자 공백..." 패턴인지 판별:
+    # 전체 길이 대비 공백 비율이 30% 이상이고
+    # 연속 비공백이 2자 이하인 토큰이 대부분이면 글자분리로 판단
+    tokens = text.split()
+    if not tokens:
+        return text
+
+    short_tokens = sum(1 for t in tokens if len(t) <= 2)
+    ratio = short_tokens / len(tokens)
+
+    if ratio >= 0.6 and len(tokens) >= 3:
+        return collapsed
+
+    return text
 
 def _normalize_known_prefix_punctuation(text: str) -> str:
     """선두 접두어 괄호 안 쉼표를 마침표로 정규화한다.
@@ -794,14 +822,7 @@ def split_official_name(name: str) -> tuple[str, str]:
 
 
 def build_bare_name_index(master_names: list) -> dict[str, list[str]]:
-    """마스터 명칭으로 순수명칭 인덱스를 생성한다.
-
-    Args:
-        master_names: 공식명칭 목록.
-
-    Returns:
-        `순수명칭 -> [공식명칭, ...]` 딕셔너리.
-    """
+    """마스터 명칭으로 순수명칭 인덱스를 생성한다."""
     index: dict[str, list[str]] = {}
     for official in master_names:
         _, bare = split_official_name(official)
@@ -809,7 +830,6 @@ def build_bare_name_index(master_names: list) -> dict[str, list[str]]:
             continue
         index.setdefault(bare, []).append(official)
     return index
-
 
 DEFAULT_MASTER_NAMES = [
     "(민간)부산미음동물류",
@@ -1199,6 +1219,9 @@ class NameMatcher:
         if self._is_excluded(text):
             return []
 
+        # ★ 글자분리 복원
+        text = _collapse_spaced_text(text)
+
         if text in self.master_set:
             return [text]
         if text in self.bare_to_official:
@@ -1245,6 +1268,7 @@ class NameMatcher:
 
         return found
 
+
     def _best_similarity(self, text: str):
         """순수명칭 기준 최고 유사도 공식명칭을 찾는다."""
         cached = self._similarity_cache.get(text)
@@ -1280,24 +1304,14 @@ class NameMatcher:
         self._similarity_cache[text] = result
         return result
 
-    def match(self, text: str) -> Optional[dict]:
-        """단일 문자열을 마스터 명칭 규칙으로 판정한다.
-
-        판정 결과의 불일치 사유는 3가지 카테고리로 분류된다:
-        - 공사명 불일치: 순수명칭 자체가 다름
-        - 접두어(사업유형) 불일치: 순수명칭은 맞으나 접두어가 다름
-        - 연도 불일치: 접두어·공사명은 같고 연도만 다름
-
-        Args:
-            text: 검사 대상 문자열.
-
-        Returns:
-            ``{input, status, suggestion, issue}`` 형태 dict 또는 ``None``.
-        """
+    def match(self, text: str, source_text: str = "") -> Optional[dict]:
+        """단일 문자열을 마스터 명칭 규칙으로 판정한다."""
         text = str(text or "").strip()
         if not text or self._is_excluded(text):
             return None
 
+        text = _collapse_spaced_text(text)
+        source_text = _collapse_spaced_text(str(source_text or "").strip())
         match_text = _normalize_known_prefix_punctuation(text)
 
         # ── STEP 1: 공식명칭 포함 판정 (일치) ──
@@ -1310,6 +1324,18 @@ class NameMatcher:
         normalized = self._normalize(match_text)
         split_prefix, split_bare = strip_known_prefix(match_text)
         split_bare = split_bare or normalized
+        # ★ 서술문 부가정보 제거 (괄호+숫자/금액, 대괄호 등)
+        _cleaned_bare = split_bare
+        _cleaned_bare = re.sub(r'\([^)]*\d[^)]*\)', '', _cleaned_bare)
+        _cleaned_bare = re.sub(
+            r'\([^)]*(?:조정|증액|감액|변경|추가)[^)]*\)', '', _cleaned_bare
+        )
+        _cleaned_bare = re.sub(r'\[[^\]]*\]', '', _cleaned_bare)
+        _cleaned_bare = re.sub(r'\d+[억원조만%]+.*$', '', _cleaned_bare)
+        _cleaned_bare = re.sub(r'^[^가-힣a-zA-Z0-9]+', '', _cleaned_bare)
+        _cleaned_bare = _cleaned_bare.strip()
+        if _cleaned_bare and _cleaned_bare != split_bare:
+            split_bare = _cleaned_bare
         stripped_input = match_text.strip().strip(STRIP_CHARS).strip()
         is_direct_prefix_form = (
             bool(split_prefix)
@@ -1317,39 +1343,77 @@ class NameMatcher:
             and stripped_input.startswith(split_prefix)
         )
 
-        if split_bare in self.bare_to_official:
-            officials = self.bare_to_official[split_bare]
+        # ★ 순수명칭 조회 (원본 → 공백제거 순서로 시도)
+        lookup_bare = split_bare
+        pending_direct_result = None
+        direct_officials: list[str] = []
+        narrative_bares: set[str] = set()
+        narrative_context = False
+        if split_bare not in self.bare_to_official:
+            bare_no_space = split_bare.replace(" ", "")
+            if bare_no_space != split_bare:
+                for master_bare in self.bare_to_official:
+                    if master_bare.replace(" ", "") == bare_no_space:
+                        lookup_bare = master_bare
+                        break
+
+        if lookup_bare in self.bare_to_official:
+            officials = self.bare_to_official[lookup_bare]
+            direct_officials = officials
+
             if len(officials) == 1:
                 official = officials[0]
                 official_prefix = self.official_prefix.get(official, "")
 
                 if not split_prefix:
-                    return {
+                    pending_direct_result = {
                         "input": text,
                         "status": "불일치",
                         "suggestion": official,
                         "issue": f"접두어(사업유형) 불일치: 접두어 누락 → 공식: {official}",
                     }
-
-                if split_prefix == official_prefix:
+                elif split_prefix == official_prefix:
+                    return {
+                        "input": text,
+                        "status": "일치",
+                        "suggestion": official,
+                        "issue": "",
+                    }
+                else:
                     return {
                         "input": text,
                         "status": "불일치",
                         "suggestion": official,
-                        "issue": f"접두어(사업유형) 불일치: 괄호 표기 누락 → 공식: {official}",
+                        "issue": (
+                            f"접두어(사업유형) 불일치: "
+                            f"{split_prefix} → {official_prefix} → 공식: {official}"
+                        ),
                     }
+            else:
+                pending_direct_result = self._build_ambiguous_result(text, officials)
 
+        if source_text:
+            narrative_bares = {bare for bare in (split_bare, lookup_bare) if bare}
+            narrative_patterns = []
+            for bare in narrative_bares:
+                narrative_patterns.extend((
+                    re.compile(rf'{re.escape(bare)}\s*\(\s*[\d,]+[%억원조만]'),
+                    re.compile(rf'{re.escape(bare)}\s*\(\s*(조정|증액|감액|변경|추가)'),
+                    re.compile(rf'{re.escape(bare)}\s*\d+[억원조만]'),
+                ))
+            narrative_context = any(
+                pattern.search(source_text) for pattern in narrative_patterns
+            )
+            if narrative_context and direct_officials:
                 return {
                     "input": text,
-                    "status": "불일치",
-                    "suggestion": official,
-                    "issue": (
-                        f"접두어(사업유형) 불일치: "
-                        f"{split_prefix} → {official_prefix} → 공식: {official}"
-                    ),
+                    "status": "일치",
+                    "suggestion": direct_officials[0],
+                    "issue": "",
                 }
 
-            return self._build_ambiguous_result(text, officials)
+        if pending_direct_result:
+            return pending_direct_result
 
         # 괄호 없는 "접두어+명칭" 형태의 유사 매칭
         if is_direct_prefix_form and len(split_bare) >= 4:
@@ -1374,12 +1438,46 @@ class NameMatcher:
         if containing:
             if len(containing) == 1:
                 _, candidate_bare = split_official_name(containing[0])
-                candidate_bare = candidate_bare.replace(" ", "")
-                compare_text = normalized.replace(" ", "")
+                candidate_bare_ns = candidate_bare.replace(" ", "")
+                compare_text_ns = normalized.replace(" ", "")
+
+                # ★ 마스터 명칭으로 시작하고 뒤에 비명칭 문자가 붙은 경우 → 서술문
+                if (
+                    compare_text_ns.startswith(candidate_bare_ns)
+                    and len(compare_text_ns) > len(candidate_bare_ns)
+                ):
+                    leftover = compare_text_ns[len(candidate_bare_ns):]
+                    if not re.match(r'^[가-힣a-zA-Z]', leftover):
+                        official = containing[0]
+                        official_prefix = self.official_prefix.get(official, "")
+                        if split_prefix and split_prefix == official_prefix:
+                            return {
+                                "input": text,
+                                "status": "일치",
+                                "suggestion": official,
+                                "issue": "",
+                            }
+                        elif split_prefix:
+                            return {
+                                "input": text,
+                                "status": "불일치",
+                                "suggestion": official,
+                                "issue": (
+                                    f"접두어(사업유형) 불일치: "
+                                    f"{split_prefix} → {official_prefix} → 공식: {official}"
+                                ),
+                            }
+                        else:
+                            return {
+                                "input": text,
+                                "status": "일치",
+                                "suggestion": official,
+                                "issue": "",
+                            }
 
                 likely_typo = (
-                    compare_text.startswith(candidate_bare)
-                    and len(compare_text) - len(candidate_bare) <= 1
+                    compare_text_ns.startswith(candidate_bare_ns)
+                    and len(compare_text_ns) - len(candidate_bare_ns) <= 1
                 )
                 if not likely_typo:
                     return {
@@ -1392,12 +1490,96 @@ class NameMatcher:
                 return self._build_ambiguous_result(text, containing)
 
         # ── STEP 4: 유사도 비교 ──
-        best_name, best_score = self._best_similarity(normalized)
-        if best_score >= 0.7:
+        # ★ 괄호/숫자 부가정보 제거 후 재비교용 텍스트 준비
+        clean_normalized = re.sub(r'[\(\[（【][^)\]）】]*[\)\]）】]', '', normalized).strip()
+        clean_normalized = re.sub(r'\d+[억백천만원%]+.*$', '', clean_normalized).strip()
+
+        for compare_text in [normalized, clean_normalized]:
+            if not compare_text:
+                continue
+
+            best_name, best_score = self._best_similarity(compare_text)
+            if not best_name or best_score < 0.7:
+                continue
+
             _, best_bare = split_official_name(best_name)
             best_prefix = self.official_prefix.get(best_name, "")
 
-            # 연도만 다른지 판별 (접두어 분리된 경우)
+            # ★ 공백만 다른 경우 — 접두어까지 맞으면 일치
+            if compare_text.replace(" ", "") == best_bare.replace(" ", ""):
+                if split_prefix and split_prefix == best_prefix:
+                    return {
+                        "input": text,
+                        "status": "일치",
+                        "suggestion": best_name,
+                        "issue": "",
+                    }
+                elif split_prefix:
+                    return {
+                        "input": text,
+                        "status": "불일치",
+                        "suggestion": best_name,
+                        "issue": (
+                            f"접두어(사업유형) 불일치: "
+                            f"{split_prefix} → {best_prefix} → 공식: {best_name}"
+                        ),
+                    }
+
+            # ★ 클린 텍스트로 비교 시 유사도 93% 이상이면 서술문으로 판단
+            if compare_text != normalized and best_score >= 0.93:
+                if not split_prefix:
+                    return {
+                        "input": text,
+                        "status": "일치",
+                        "suggestion": best_name,
+                        "issue": "",
+                    }
+                elif split_prefix == best_prefix:
+                    return {
+                        "input": text,
+                        "status": "일치",
+                        "suggestion": best_name,
+                        "issue": "",
+                    }
+
+            if (
+                compare_text == clean_normalized
+                and narrative_context
+                and best_score >= 0.85
+            ):
+                return {
+                    "input": text,
+                    "status": "일치",
+                    "suggestion": best_name,
+                    "issue": "",
+                }
+
+            # ★ 마스터 bare로 시작하고 뒤에 비명칭 문자만 붙은 경우
+            compare_ns = compare_text.replace(" ", "")
+            bare_ns = best_bare.replace(" ", "")
+            if (
+                compare_ns.startswith(bare_ns)
+                and len(compare_ns) > len(bare_ns)
+                and not re.match(r'^[가-힣a-zA-Z]', compare_ns[len(bare_ns):])
+            ):
+                if not split_prefix or split_prefix == best_prefix:
+                    return {
+                        "input": text,
+                        "status": "일치",
+                        "suggestion": best_name,
+                        "issue": "",
+                    }
+                else:
+                    return {
+                        "input": text,
+                        "status": "불일치",
+                        "suggestion": best_name,
+                        "issue": (
+                            f"접두어(사업유형) 불일치: "
+                            f"{split_prefix} → {best_prefix} → 공식: {best_name}"
+                        ),
+                    }
+
             if (
                 split_prefix
                 and split_prefix == best_prefix
@@ -1410,7 +1592,6 @@ class NameMatcher:
                     "issue": f"연도 불일치 → 유사: {best_name}",
                 }
 
-            # 연도만 다른지 판별 (정규화된 전체 비교)
             if _is_year_only_diff(normalized, best_bare):
                 return {
                     "input": text,
@@ -1418,6 +1599,31 @@ class NameMatcher:
                     "suggestion": best_name,
                     "issue": f"연도 불일치 → 유사: {best_name}",
                 }
+
+            # ★ 서술문 판별: source_text에서 순수명칭 뒤에 부가정보 패턴이 있으면 일치 처리
+            if source_text and best_score >= 0.7:
+                _, check_bare = split_official_name(best_name)
+                if check_bare:
+                    _narr_patterns = [
+                        re.compile(rf'{re.escape(check_bare)}\s*\(\s*[\d,]+[%억원조만]'),
+                        re.compile(rf'{re.escape(check_bare)}\s*\(\s*(?:조정|증액|감액|변경|추가)'),
+                        re.compile(rf'{re.escape(check_bare)}\s*\d+[억원조만]'),
+                    ]
+                    check_bare_ns = check_bare.replace(" ", "")
+                    if check_bare_ns != check_bare:
+                        _narr_patterns.extend([
+                            re.compile(rf'{re.escape(check_bare_ns)}\s*\(\s*[\d,]+[%억원조만]'),
+                            re.compile(rf'{re.escape(check_bare_ns)}\s*\(\s*(?:조정|증액|감액|변경|추가)'),
+                            re.compile(rf'{re.escape(check_bare_ns)}\s*\d+[억원조만]'),
+                        ])
+                    source_ns = source_text.replace(" ", "")
+                    if any(p.search(source_text) or p.search(source_ns) for p in _narr_patterns):
+                        return {
+                            "input": text,
+                            "status": "일치",
+                            "suggestion": best_name,
+                            "issue": "",
+                        }
 
             pct = f"{best_score * 100:.0f}%"
             return {
@@ -1428,6 +1634,7 @@ class NameMatcher:
             }
 
         return None
+
 
     def check(self, text: str):
         """단일 문자열을 마스터 명칭 규칙으로 판정한다."""
@@ -1531,8 +1738,10 @@ class ReviewEngine:
                 return f"P{page_match.group(1)}"
             return str(location or "")
 
-        def consume_candidate(candidate: str, location: str):
-            match_result = self.matcher.match(candidate)
+        def consume_candidate(candidate: str, location: str,
+                              source_text: str = ""):
+            """후보 명칭을 판정하고 결과에 추가한다."""
+            match_result = self.matcher.match(candidate, source_text=source_text)
             if not match_result:
                 return
 
@@ -1542,6 +1751,17 @@ class ReviewEngine:
                 match_results = [match_result]
 
             for match_item in match_results:
+                if match_item.get("status") != "일치":
+                    suggestion = match_item.get("suggestion", "")
+                    scope = _location_scope_key(location)
+                    if any(
+                        existing_key[0] == scope
+                        and existing_key[2] == "일치"
+                        and existing_key[3] == suggestion
+                        for existing_key in checked_results
+                    ):
+                        continue
+
                 key = (
                     _location_scope_key(location),
                     match_item.get("input", candidate),
@@ -1563,6 +1783,11 @@ class ReviewEngine:
                 checked_results[key] = stored_result
                 checked_locations[key] = [location]
 
+        # ★ 글자분리 복원 (PDF 텍스트 전처리)
+        text_items = [
+            (loc, _collapse_spaced_text(txt)) for loc, txt in text_items
+        ]
+
         full_text, starts, offsets = self._build_full_text_with_offsets(text_items)
         if full_text:
             match_events = []
@@ -1582,7 +1807,7 @@ class ReviewEngine:
                 local_start = match.start() - line_start
                 local_end = local_start + len(match.group(0))
                 candidate = self._extend_official_candidate(source_text, local_start, local_end)
-                match_events.append((match.start(), 0, candidate, location))
+                match_events.append((match.start(), 0, candidate, location, source_text))
 
             for match in self.matcher._bare_pattern.finditer(full_text):
                 idx = self._find_offset_index(starts, offsets, match.start())
@@ -1606,13 +1831,13 @@ class ReviewEngine:
                         )
                         prefix_cache[cache_key] = reconstructed
                     candidate = reconstructed if reconstructed else bare
-                match_events.append((match.start(), 1, candidate, location))
+                match_events.append((match.start(), 1, candidate, location, source_text))
 
             _emit_progress(0.6)
             match_events.sort(key=lambda item: (item[0], item[1]))
 
-            for _, _, candidate, location in match_events:
-                consume_candidate(candidate, location)
+            for _, _, candidate, location, source_text in match_events:
+                consume_candidate(candidate, location, source_text)
 
             unmatched_indices = [
                 idx for idx in range(len(offsets))
@@ -1655,7 +1880,7 @@ class ReviewEngine:
                         aux_candidate_cache[probe_text] = cached_candidates
 
                     for candidate in cached_candidates:
-                        consume_candidate(candidate, location)
+                        consume_candidate(candidate, location, source_text)
                         consumed_probe = True
 
                 if consumed_probe or "(" in text or ")" in text:
@@ -1677,7 +1902,7 @@ class ReviewEngine:
                     lead_result
                     and "특정불가" in str(lead_result.get("issue", ""))
                 ):
-                    consume_candidate(lead, location)
+                    consume_candidate(lead, location, source_text)
         else:
             _emit_progress(0.6)
 

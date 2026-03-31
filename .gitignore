@@ -21,3 +21,4 @@ dist/
 *.pdf
 *.hwp
 *.docx
+debug_search.py
