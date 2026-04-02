@@ -93,16 +93,21 @@ async def review_to_excel(file: UploadFile = File(...)):
     report_path = tmp_path + "_report.xlsx"
     try:
         result = engine.review_file(tmp_path)
-        save_excel_report(result, report_path)
-        return FileResponse(
-            report_path,
-            filename=f"검토결과_{file.filename}.xlsx",
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    finally:
+        save_excel_report([result], report_path, matcher.master_names)
+    except Exception as e:
         os.unlink(tmp_path)
+        raise HTTPException(500, f"Excel 생성 오류: {e}")
+    os.unlink(tmp_path)
+    from starlette.background import BackgroundTask
+    def cleanup():
         if os.path.exists(report_path):
             os.unlink(report_path)
+    return FileResponse(
+        report_path,
+        filename=f"검토결과_{file.filename}.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        background=BackgroundTask(cleanup),
+    )
 
 os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")

@@ -278,13 +278,19 @@ btnSnapshot.addEventListener('click',()=>{
 });
 
 btnExcel.addEventListener('click',async()=>{
-  if(!files.length)return;
-  const form=new FormData();form.append('file',files[0]);
-  const resp=await fetch('/api/review/excel',{method:'POST',body:form});
-  if(!resp.ok){alert('Excel 생성 실패');return;}
-  const blob=await resp.blob();const url=URL.createObjectURL(blob);
-  const a=document.createElement('a');a.href=url;a.download=`검토결과_${files[0].name}.xlsx`;
-  a.click();URL.revokeObjectURL(url);
+  if(!allResults.length){alert('먼저 검토를 실행하세요.');return;}
+  for(const r of allResults){
+    const f=files.find(x=>x.name===r.file);
+    if(!f)continue;
+    const form=new FormData();form.append('file',f);
+    const resp=await fetch('/api/review/excel',{method:'POST',body:form});
+    if(!resp.ok){alert('Excel 생성 실패: '+r.file);continue;}
+    const blob=await resp.blob();const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;
+    a.download='검토결과_'+r.file.replace(/\.[^.]+$/,'')+'.xlsx';
+    document.body.appendChild(a);a.click();document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
 });
 </script>
 </body>
