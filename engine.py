@@ -1075,6 +1075,23 @@ class NameMatcher:
         self.bare_names = list(self.bare_to_official.keys())
         self.min_bare_length = min((len(name) for name in self.bare_names), default=0)
 
+        # ★ 역방향 검색용: 마스터 명칭에서 순수 한글 키워드 추출
+        _korean_re = re.compile(r'[가-힣]+')
+        self.korean_index = {}  # bare_korean -> [(prefix, bare_full, extras, official)]
+        for official in self.master_names:
+            _pfx, _bare = split_official_name(official)
+            if not _bare:
+                continue
+            _korean_parts = _korean_re.findall(_bare)
+            _bare_korean = ''.join(_korean_parts)
+            if len(_bare_korean) < 2:
+                continue
+            _extras_str = _korean_re.sub('', _bare).strip()
+            _extras = [e for e in re.split(r'\s+', _extras_str) if e]
+            entry = (_pfx, _bare, _extras, official)
+            self.korean_index.setdefault(_bare_korean, []).append(entry)
+        self.korean_keys_sorted = sorted(self.korean_index.keys(), key=len, reverse=True)
+
         self.official_prefix = {
             official: split_official_name(official)[0] for official in self.master_names
         }
@@ -1725,215 +1742,294 @@ class ReviewEngine:
         return [primary] if primary else []
 
     def review_file(self, filepath: str, progress_callback=None) -> dict:
-        """단일 파일을 검토해 공사명칭 판정 결과를 반환한다."""
-        def _emit_progress(value: float):
+        """v11: PyMuPDF + 토큰 윈도우 1단계 + 한글키워드 2단계.
+        1단계: 마스터 토큰이 앵커 ±50자 내에 모두 존재 → 일치
+        2단계: 한글 키워드만 있고 1단계 미매칭 → 접두어 검증 → 불일치
+        """
+        import fitz as _fitz
+
+        def _emit(value):
             if progress_callback is None:
                 return
             try:
-                clamped = max(0.0, min(1.0, float(value)))
-                progress_callback(clamped)
+                progress_callback(max(0.0, min(1.0, float(value))))
             except Exception:
                 pass
 
         filename = os.path.basename(filepath)
         try:
-            text_items = extract_text_from_file(
-                filepath,
-                progress_callback=progress_callback,
-            )
-            _emit_progress(0.3)
+            ext = os.path.splitext(filepath)[1].lower()
+            if ext == '.pdf':
+                _doc = _fitz.open(filepath)
+                text_items = []
+                _total_pages = len(_doc)
+                for _pi in range(_total_pages):
+                    _page_text = _doc[_pi].get_text("text")
+                    for _li, _line in enumerate(_page_text.split('\n')):
+                        _line = _line.strip()
+                        if _line:
+                            text_items.append((f"P{_pi+1} L{_li+1}", _line))
+                    _emit(0.2 * ((_pi + 1) / _total_pages))
+                _doc.close()
+            else:
+                text_items = extract_text_from_file(filepath, progress_callback=progress_callback)
+            _emit(0.25)
         except Exception as e:
-            _emit_progress(1.0)
-            return {
-                "file": filename, "path": filepath,
-                "total": 0, "matched": 0, "mismatched": 0, "warning": 0,
-                "overall": "오류", "details": [], "error": str(e)
-            }
+            _emit(1.0)
+            return {"file": filename, "path": filepath, "total": 0, "matched": 0,
+                    "mismatched": 0, "warning": 0, "overall": "오류", "details": [], "error": str(e)}
+
+        _norm_re = re.compile(r'[\s()（）.·,\-]')
+        _token_re = re.compile(r'[가-힣]+|[A-Za-z]+|\d+')
+        _kor_re = re.compile(r'[가-힣]+')
+        _alnum_re = re.compile(r'[A-Za-z0-9]+')
+
+        # ── 마스터 인덱스 구축 ──
+        master_token_index = {}
+        master_korean_index = {}
+
+        for official in self.matcher.master_names:
+            prefix, bare = split_official_name(official)
+            nk = _norm_re.sub('', official)
+            tokens = [t for t in _token_re.findall(nk) if len(t) >= 2]
+            kor_tokens = [t for t in tokens if _kor_re.fullmatch(t)]
+
+            if kor_tokens:
+                anchor = max(kor_tokens, key=len)
+                master_token_index[official] = {
+                    "tokens": tokens, "anchor": anchor,
+                    "prefix": prefix, "bare": bare, "norm": nk,
+                }
+
+            kor_only = ''.join(_kor_re.findall(bare))
+            if len(kor_only) >= 2:
+                suffix = ''.join(_alnum_re.findall(bare)).upper()
+                year_m = re.match(r'(\d{2,4})년', bare)
+                year = year_m.group(1) if year_m else ""
+                if len(year) == 4:
+                    year = year[2:]
+                master_korean_index.setdefault(kor_only, []).append({
+                    "official": official, "prefix": prefix,
+                    "bare": bare, "suffix": suffix, "year": year,
+                })
+
+        korean_keys_sorted = sorted(master_korean_index.keys(), key=len, reverse=True)
+
+        # ── 페이지별 처리 ──
+        page_data = {}
+        for loc, txt in text_items:
+            pm = re.search(r'P(\d+)', loc)
+            pk = f"P{pm.group(1)}" if pm else loc
+            page_data.setdefault(pk, []).append((loc, txt))
 
         results = []
-        checked_results: dict[tuple[str, str, str, str], dict] = {}
-        checked_locations: dict[tuple[str, str, str, str], list[str]] = {}
+        total_pages = len(page_data)
 
-        def _location_scope_key(location: str) -> str:
-            """결과 병합용 위치 범위를 계산한다."""
-            page_match = re.search(r'P(\d+)', location or "")
-            if page_match:
-                return f"P{page_match.group(1)}"
-            return str(location or "")
+        for pg_idx, (pk, items) in enumerate(page_data.items()):
+            page_full = '\n'.join(txt for _, txt in items)
+            page_norm = _norm_re.sub('', page_full)
 
-        def consume_candidate(candidate: str, location: str,
-                              source_text: str = ""):
-            """후보 명칭을 판정하고 결과에 추가한다."""
-            match_result = self.matcher.match(candidate, source_text=source_text)
-            if not match_result:
-                return
+            # norm→raw 위치 매핑
+            norm_to_raw = []
+            for ri, ch in enumerate(page_full):
+                if not _norm_re.match(ch):
+                    norm_to_raw.append(ri)
 
-            if isinstance(match_result, list):
-                match_results = match_result
-            else:
-                match_results = [match_result]
-
-            for match_item in match_results:
-                if match_item.get("status") != "일치":
-                    suggestion = match_item.get("suggestion", "")
-                    scope = _location_scope_key(location)
-                    if any(
-                        existing_key[0] == scope
-                        and existing_key[2] == "일치"
-                        and existing_key[3] == suggestion
-                        for existing_key in checked_results
-                    ):
-                        continue
-
-                key = (
-                    _location_scope_key(location),
-                    match_item.get("input", candidate),
-                    match_item.get("status", ""),
-                    match_item.get("suggestion", ""),
-                )
-
-                if key in checked_results:
-                    existing = checked_results[key]
-                    locs = checked_locations[key]
-                    if location not in locs:
-                        locs.append(location)
-                        existing["location"] = ", ".join(locs)
-                    continue
-
-                stored_result = dict(match_item)
-                stored_result["location"] = location
-                results.append(stored_result)
-                checked_results[key] = stored_result
-                checked_locations[key] = [location]
-
-        # ★ 글자분리 복원 (PDF 텍스트 전처리)
-        text_items = [
-            (loc, _collapse_spaced_text(txt)) for loc, txt in text_items
-        ]
-
-        full_text, starts, offsets = self._build_full_text_with_offsets(text_items)
-        if full_text:
-            match_events = []
-            matched_offset_indices = set()
-            aux_candidate_cache: dict[str, list[str]] = {}
-            prefix_cache: dict[str, Optional[str]] = {}
-            has_korean_re = re.compile(r"[가-힣]")
-            min_aux_length = self.matcher.min_bare_length * 0.5
-            page_lines = full_text.splitlines()
-
-            for match in self.matcher._official_pattern.finditer(full_text):
-                idx = self._find_offset_index(starts, offsets, match.start())
-                if idx < 0:
-                    continue
-                matched_offset_indices.add(idx)
-                line_start, _, location, source_text = offsets[idx]
-                local_start = match.start() - line_start
-                local_end = local_start + len(match.group(0))
-                candidate = self._extend_official_candidate(source_text, local_start, local_end)
-                match_events.append((match.start(), 0, candidate, location, source_text))
-
-            for match in self.matcher._bare_pattern.finditer(full_text):
-                idx = self._find_offset_index(starts, offsets, match.start())
-                if idx < 0:
-                    continue
-                matched_offset_indices.add(idx)
-                _, _, location, source_text = offsets[idx]
-                bare = match.group(0)
-                prefixed = self.matcher._extract_prefixed_candidate(source_text, bare)
-                if prefixed:
-                    candidate = prefixed
+            def _norm_pos_to_loc(npos):
+                if npos < len(norm_to_raw):
+                    raw_pos = norm_to_raw[npos]
                 else:
-                    bare_line_idx = full_text[:match.start()].count("\n")
-                    cache_key = f"{bare}|{bare_line_idx}"
-                    if cache_key in prefix_cache:
-                        reconstructed = prefix_cache[cache_key]
+                    raw_pos = len(page_full) - 1
+                cum = 0
+                for loc, txt in items:
+                    if cum + len(txt) + 1 > raw_pos:
+                        return loc
+                    cum += len(txt) + 1
+                return items[-1][0] if items else pk
+
+            # ── 1단계: 토큰 윈도우 매칭 (일치) ──
+            matched_anchors = []  # (norm_pos, norm_end, official)
+
+            for official, info in master_token_index.items():
+                anchor = info["anchor"]
+                tokens = info["tokens"]
+                spos = 0
+                while True:
+                    pos = page_norm.find(anchor, spos)
+                    if pos < 0:
+                        break
+                    spos = pos + 1
+
+                    ws = max(0, pos - 50)
+                    we = min(len(page_norm), pos + len(anchor) + 50)
+                    window = page_norm[ws:we]
+
+                    if all(t in window for t in tokens):
+                        hit_loc = _norm_pos_to_loc(pos)
+                        matched_anchors.append((pos, pos + len(anchor), official))
+                        results.append({
+                            "input": official, "location": hit_loc,
+                            "status": "일치", "suggestion": official, "issue": ""
+                        })
+
+            # ── 2단계: 한글 키워드 불일치 검출 ──
+            for kor_key in korean_keys_sorted:
+                spos = 0
+                while True:
+                    pos = page_norm.find(kor_key, spos)
+                    if pos < 0:
+                        break
+                    spos = pos + 1
+                    nk_end = pos + len(kor_key)
+
+                    # 1단계에서 이미 매칭된 범위면 스킵
+                    already = any(pos < me and nk_end > ms for ms, me, _ in matched_anchors)
+                    if already:
+                        continue
+
+                    hit_loc = _norm_pos_to_loc(pos)
+                    entries = master_korean_index[kor_key]
+
+                    ctx_before_n = page_norm[max(0, pos - 30):pos]
+                    ctx_after_n = page_norm[nk_end:nk_end + 50]
+
+                    # suffix 추출
+                    doc_suffix_m = re.match(r'([A-Za-z0-9]+)', ctx_after_n)
+                    doc_suffix = doc_suffix_m.group(1).upper() if doc_suffix_m else ""
+
+                    # 연도 추출
+                    doc_year = ""
+                    yr_m = re.search(r'(\d{2,4})년', ctx_before_n)
+                    if yr_m:
+                        doc_year = yr_m.group(1)
+                        if len(doc_year) == 4:
+                            doc_year = doc_year[2:]
+
+                    # 마스터 필터링
+                    candidates = []
+                    for entry in entries:
+                        m_suffix = entry["suffix"]
+                        m_year = entry["year"]
+                        if m_year and doc_year and m_year != doc_year:
+                            continue
+                        if m_suffix:
+                            if not doc_suffix:
+                                continue
+                            if doc_suffix == m_suffix:
+                                candidates.append((entry, 100))
+                            elif doc_suffix.endswith(m_suffix):
+                                candidates.append((entry, 90))
+                            elif m_suffix.startswith(doc_suffix) or doc_suffix.startswith(m_suffix):
+                                candidates.append((entry, 50))
+                            else:
+                                continue
+                        else:
+                            if doc_suffix and len(doc_suffix) > 1:
+                                continue
+                            candidates.append((entry, 80))
+
+                    if not candidates:
+                        continue
+
+                    candidates.sort(key=lambda x: -x[1])
+
+                    if len(candidates) > 1 and candidates[0][1] == candidates[1][1]:
+                        top = candidates[0][1]
+                        tied = [c[0] for c in candidates if c[1] == top]
+                        if len(tied) > 1:
+                            names = " / ".join(t["official"] for t in tied)
+                            results.append({
+                                "input": kor_key, "location": hit_loc,
+                                "status": "불일치", "suggestion": tied[0]["official"],
+                                "issue": f"공사명 불일치: 특정불가 ({len(tied)}건) → {names}"
+                            })
+                            continue
+
+                    best = candidates[0][0]
+                    m_prefix = best["prefix"]
+                    if not m_prefix:
+                        continue
+
+                    m_pfx_norm = m_prefix.replace('.', '').replace(',', '')
+                    found_pfx = ""
+
+                    # 접두어 검색: 앞에서 (한글 바로 앞 제외)
+                    for kp in KNOWN_PREFIXES:
+                        kpn = kp.replace('.', '').replace(',', '')
+                        if not kpn:
+                            continue
+                        if ctx_before_n.endswith(kpn):
+                            pfx_start = len(ctx_before_n) - len(kpn)
+                            if pfx_start > 0 and re.match(r'[가-힣]', ctx_before_n[pfx_start - 1]):
+                                continue
+                            found_pfx = kp
+                            break
+
+                    # 뒤에서 괄호형
+                    if not found_pfx:
+                        raw_pos = norm_to_raw[min(nk_end, len(norm_to_raw)-1)] if nk_end < len(norm_to_raw) else len(page_full)
+                        after_raw = page_full[raw_pos:raw_pos + 60]
+                        for pp in re.findall(r'\(([^)]+)\)', after_raw):
+                            pp_clean = pp.replace(',', '.').strip()
+                            if pp_clean in KNOWN_PREFIXES:
+                                found_pfx = pp_clean
+                                break
+                            ppn = pp_clean.replace('.', '')
+                            for kp in KNOWN_PREFIXES:
+                                if kp.replace('.', '') == ppn:
+                                    found_pfx = kp
+                                    break
+                            if found_pfx:
+                                break
+
+                    # 앞 raw 괄호형
+                    if not found_pfx:
+                        raw_pos_s = norm_to_raw[max(0, pos-1)] if pos > 0 and pos-1 < len(norm_to_raw) else 0
+                        before_raw = page_full[max(0, raw_pos_s - 40):raw_pos_s + 1]
+                        for pp in re.findall(r'\(([^)]+)\)', before_raw):
+                            pp_clean = pp.replace(',', '.').strip()
+                            if pp_clean in KNOWN_PREFIXES:
+                                found_pfx = pp_clean
+                                break
+                            ppn = pp_clean.replace('.', '')
+                            for kp in KNOWN_PREFIXES:
+                                if kp.replace('.', '') == ppn:
+                                    found_pfx = kp
+                                    break
+                            if found_pfx:
+                                break
+
+                    if found_pfx:
+                        fpn = found_pfx.replace('.', '').replace(',', '')
+                        if fpn == m_pfx_norm:
+                            results.append({
+                                "input": best["official"], "location": hit_loc,
+                                "status": "일치", "suggestion": best["official"], "issue": ""
+                            })
+                            continue
+                        else:
+                            issue = f"접두어(사업유형) 불일치: {found_pfx} → {m_prefix} → 공식: {best['official']}"
                     else:
-                        reconstructed = _reconstruct_prefix(
-                            bare, page_lines, bare_line_idx,
-                            self.matcher.master_set, KNOWN_PREFIXES
-                        )
-                        prefix_cache[cache_key] = reconstructed
-                    candidate = reconstructed if reconstructed else bare
-                match_events.append((match.start(), 1, candidate, location, source_text))
+                        is_narr = bool(re.match(r'[\d,]+[%억원조만]', ctx_after_n))
+                        if is_narr:
+                            continue
+                        issue = f"접두어(사업유형) 불일치: 접두어 누락 → 공식: {best['official']}"
 
-            _emit_progress(0.6)
-            match_events.sort(key=lambda item: (item[0], item[1]))
+                    inp = kor_key
+                    if found_pfx:
+                        inp = f"({found_pfx}){kor_key}"
 
-            for _, _, candidate, location, source_text in match_events:
-                consume_candidate(candidate, location, source_text)
+                    results.append({
+                        "input": inp, "location": hit_loc,
+                        "status": "불일치", "suggestion": best["official"], "issue": issue
+                    })
 
-            unmatched_indices = [
-                idx for idx in range(len(offsets))
-                if idx not in matched_offset_indices
-            ]
-            unmatched_total = len(unmatched_indices)
-
-            for processed, idx in enumerate(unmatched_indices, 1):
-                _, _, location, source_text = offsets[idx]
-                if processed % 100 == 0 or processed == unmatched_total:
-                    ratio = processed / unmatched_total if unmatched_total else 1.0
-                    _emit_progress(0.6 + 0.35 * ratio)
-
-                if idx in matched_offset_indices:
-                    continue
-                text = source_text.strip()
-                if len(text) > 80:
-                    continue
-                if len(text) < 2:
-                    continue
-                if text in self.matcher.EXCLUDE_WORDS:
-                    continue
-                if not has_korean_re.search(text):
-                    continue
-                if min_aux_length > 0 and len(text) < min_aux_length:
-                    continue
-
-                consumed_probe = False
-                for probe_text in self._iter_aux_candidates(text):
-                    if min_aux_length > 0 and len(probe_text) < min_aux_length:
-                        continue
-                    if probe_text in self.matcher.EXCLUDE_WORDS:
-                        continue
-                    if not has_korean_re.search(probe_text):
-                        continue
-
-                    cached_candidates = aux_candidate_cache.get(probe_text)
-                    if cached_candidates is None:
-                        cached_candidates = self.matcher.find_all_in_text(probe_text)
-                        aux_candidate_cache[probe_text] = cached_candidates
-
-                    for candidate in cached_candidates:
-                        consume_candidate(candidate, location, source_text)
-                        consumed_probe = True
-
-                if consumed_probe or "(" in text or ")" in text:
-                    continue
-
-                parts = text.split()
-                if not parts:
-                    continue
-                lead = _strip_surrounding(parts[0])
-                if min_aux_length > 0 and len(lead) < min_aux_length:
-                    continue
-                if lead in self.matcher.EXCLUDE_WORDS:
-                    continue
-                if not has_korean_re.search(lead):
-                    continue
-
-                lead_result = self.matcher.match(lead)
-                if (
-                    lead_result
-                    and "특정불가" in str(lead_result.get("issue", ""))
-                ):
-                    consume_candidate(lead, location, source_text)
-        else:
-            _emit_progress(0.6)
+            if total_pages > 0:
+                _emit(0.25 + 0.7 * ((pg_idx + 1) / total_pages))
 
         matched = sum(1 for r in results if r["status"] == "일치")
         mismatched = sum(1 for r in results if r["status"] == "불일치")
-        warnings = sum(
-            1 for r in results if r["status"] not in {"일치", "불일치"}
-        )
+        warnings = sum(1 for r in results if r["status"] not in ("일치", "불일치"))
         total = len(results)
 
         if total == 0:
@@ -1943,26 +2039,17 @@ class ReviewEngine:
         else:
             overall = "검토필요"
 
-        def _sort_key(result: dict) -> tuple[int, int]:
-            loc = result.get("location", "")
-            match = re.match(r'P(\d+)\s*L(\d+)', loc)
-            if match:
-                return int(match.group(1)), int(match.group(2))
-            return (999999, 999999)
+        def _sort_key(r):
+            loc = r.get("location", "")
+            m = re.match(r'P(\d+)\s*L(\d+)', loc)
+            return (int(m.group(1)), int(m.group(2))) if m else (999999, 999999)
 
         results.sort(key=_sort_key)
-        _emit_progress(1.0)
-        return {
-            "file": filename, "path": filepath,
-            "total": total, "matched": matched,
-            "mismatched": mismatched, "warning": warnings, "overall": overall,
-            "details": results, "error": None
-        }
+        _emit(1.0)
+        return {"file": filename, "path": filepath, "total": total, "matched": matched,
+                "mismatched": mismatched, "warning": warnings, "overall": overall,
+                "details": results, "error": None}
 
-
-# ═══════════════════════════════════════════════════════════
-#  Excel 리포트 생성
-# ═══════════════════════════════════════════════════════════
 def save_excel_report(all_results: list, output_path: str,
                       master_names: list):
     """검토 결과를 Excel 리포트로 저장한다."""
@@ -2082,15 +2169,12 @@ def save_excel_report(all_results: list, output_path: str,
 def generate_highlight_snapshots(
     filepath: str,
     ng_items: list[dict],
+    all_details: list[dict] = None,
     resolution: int = 250,
 ) -> list[tuple[int, bytes]]:
-    """PDF 파일에서 불일치 위치를 하이라이트한 페이지 이미지를 생성한다.
-
-    불일치 항목의 location(P{n} L{m})에서 줄 좌표를 _PDF_FIRST_CHAR_COORDS로
-    먼저 조회하고, 없으면 PyMuPDF page.search_for() 폴백을 사용한다.
-    """
+    """PDF 불일치 위치 하이라이트 + 페이지 상단 키워드별 통계 배너."""
     try:
-        import io
+        import io as _io
         import fitz
     except ImportError:
         return []
@@ -2098,124 +2182,195 @@ def generate_highlight_snapshots(
     if os.path.splitext(filepath)[1].lower() != ".pdf":
         return []
 
-    page_targets: dict[int, list[dict]] = {}
+    _korean_re = re.compile(r'[가-힣]+')
+
+    page_keywords: dict[int, list[str]] = {}
     for item in ng_items:
         location = item.get("location", "")
         if not location:
             continue
-        for page_str in re.findall(r'P(\d+)', location):
-            page_num = int(page_str)
-            page_targets.setdefault(page_num, [])
-            if item not in page_targets[page_num]:
-                page_targets[page_num].append(item)
-
-    if not page_targets:
-        return []
-
-    _year_prefix_re = re.compile(r'^\d{2,4}\s*년\s*')
-    coords_by_page = _PDF_FIRST_CHAR_COORDS.get(filepath, {})
-
-    def _get_search_keyword(item: dict) -> str:
+        suggestion = item.get("suggestion", "") or ""
         raw_input = item.get("input", "") or ""
-        raw_input = raw_input.strip().strip(STRIP_CHARS).strip()
-        _, bare = strip_known_prefix(raw_input)
+        _, bare = split_official_name(suggestion) if suggestion else ("", raw_input)
         if not bare:
             bare = raw_input
-        bare = _year_prefix_re.sub("", bare).strip()
-        return bare
+        korean_parts = _korean_re.findall(bare)
+        keyword = ''.join(korean_parts)
+        if len(keyword) < 2:
+            continue
+        for ps in re.findall(r'P(\d+)', location):
+            pn = int(ps)
+            page_keywords.setdefault(pn, [])
+            if keyword not in page_keywords[pn]:
+                page_keywords[pn].append(keyword)
 
-    def _get_line_num(item: dict) -> int:
-        """location에서 줄 번호를 추출한다."""
-        loc = item.get("location", "")
-        m = re.search(r'L(\d+)', loc)
-        return int(m.group(1)) if m else -1
+    if not page_keywords:
+        return []
 
-    dpi_scale = resolution / 72.0
-    mat = fitz.Matrix(dpi_scale, dpi_scale)
+    page_kw_stats: dict[int, dict[str, dict]] = {}
+    if all_details:
+        for item in all_details:
+            location = item.get("location", "")
+            suggestion = item.get("suggestion", "") or ""
+            _, bare = split_official_name(suggestion) if suggestion else ("", "")
+            if not bare:
+                bare = item.get("input", "")
+            kp = _korean_re.findall(bare)
+            kw = ''.join(kp)
+            if len(kw) < 2:
+                continue
+            for ps in re.findall(r'P(\d+)', location):
+                pn = int(ps)
+                page_kw_stats.setdefault(pn, {})
+                page_kw_stats[pn].setdefault(kw, {"match": 0, "mismatch": 0})
+                if item.get("status") == "일치":
+                    page_kw_stats[pn][kw]["match"] += 1
+                elif item.get("status") == "불일치":
+                    page_kw_stats[pn][kw]["mismatch"] += 1
 
-    results: list[tuple[int, bytes]] = []
+    snapshots = []
     try:
         doc = fitz.open(filepath)
-        try:
-            for page_num in sorted(page_targets.keys()):
-                page_idx = page_num - 1
-                if page_idx >= len(doc):
-                    continue
-
-                page = doc[page_idx]
-                pix = page.get_pixmap(matrix=mat)
-                img_bytes = pix.tobytes("png")
-
-                from PIL import Image, ImageDraw
-                pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                draw = ImageDraw.Draw(pil_img)
-                drew_any = False
-                page_coords = coords_by_page.get(page_num, {})
-
-                for item in page_targets[page_num]:
-                    line_num = _get_line_num(item)
-                    keyword = _get_search_keyword(item)
-
-                    # 1순위: pdfplumber 좌표 사용
-                    if line_num > 0 and line_num in page_coords:
-                        x0, top, bottom = page_coords[line_num]
-                        char_h = (bottom - top) * dpi_scale
-                        pad_y = char_h * 0.15
-                        pad_left = char_h * 0.3
-                        # 키워드 길이 기반 우측 확장
-                        char_w = char_h * 0.55
-                        text_width = len(keyword) * char_w if keyword else char_h * 5
-                        box = (
-                            x0 * dpi_scale - pad_left,
-                            top * dpi_scale - pad_y,
-                            x0 * dpi_scale + text_width + pad_left,
-                            bottom * dpi_scale + pad_y,
-                        )
-                        draw.rectangle(box, outline="red", width=3)
-                        drew_any = True
-                        continue
-
-                    # 2순위: PyMuPDF search_for 폴백
-                    if not keyword or len(keyword) < 2:
-                        continue
-
-                    rects = page.search_for(keyword)
-                    if not rects:
-                        hangul_only = re.sub(r'[^가-힣]', '', keyword)
-                        if hangul_only and len(hangul_only) >= 2:
-                            rects = page.search_for(hangul_only)
-
-                    # location의 줄 번호에 가장 가까운 rect 선택
-                    if rects and line_num > 0:
-                        # 줄 번호 기반 y좌표 추정 (페이지 높이 / 줄수)
-                        page_height = page.rect.height
-                        estimated_y = (line_num / max(len(page.get_text().splitlines()), 1)) * page_height
-                        rects.sort(key=lambda r: abs(r.y0 - estimated_y))
-                        rects = rects[:1]
-
-                    for rect in rects:
-                        x0 = rect.x0 * dpi_scale
-                        y0 = rect.y0 * dpi_scale
-                        x1 = rect.x1 * dpi_scale
-                        y1 = rect.y1 * dpi_scale
-                        char_h = y1 - y0
-                        pad_y = char_h * 0.15
-                        pad_left = char_h * 0.5
-                        pad_right = char_h * 0.5
-                        box = (x0 - pad_left, y0 - pad_y,
-                               x1 + pad_right, y1 + pad_y)
-                        draw.rectangle(box, outline="red", width=3)
-                        drew_any = True
-
-                if drew_any:
-                    buf = io.BytesIO()
-                    pil_img.save(buf, format="PNG")
-                    results.append((page_num, buf.getvalue()))
-
-        finally:
-            doc.close()
     except Exception:
-        pass
+        return []
 
-    return results
+    try:
+        scale = resolution / 72.0
+        mat = fitz.Matrix(scale, scale)
 
+        for pn in sorted(page_keywords.keys()):
+            pidx = pn - 1
+            if pidx < 0 or pidx >= len(doc):
+                continue
+
+            page = doc[pidx]
+            keywords = page_keywords[pn]
+            rects = []
+
+            for kw in keywords:
+                hits = page.search_for(kw)
+                if hits:
+                    rects.extend(hits)
+                else:
+                    sub_parts = _korean_re.findall(kw)
+                    for part in sub_parts:
+                        if len(part) >= 2:
+                            rects.extend(page.search_for(part))
+
+            for rect in rects:
+                expanded = fitz.Rect(
+                    rect.x0 - 2, rect.y0 - 2,
+                    rect.x1 + 2, rect.y1 + 2,
+                )
+                annot = page.add_rect_annot(expanded)
+                annot.set_colors(stroke=(1, 0, 0))
+                annot.set_border(width=2)
+                annot.set_opacity(0.7)
+                annot.update()
+
+            pix = page.get_pixmap(matrix=mat)
+            img_w = pix.width
+
+            try:
+                from PIL import Image, ImageDraw, ImageFont
+
+                img = Image.open(_io.BytesIO(pix.tobytes("png")))
+
+                # 폰트 크기: scale 기반으로 크게
+                font_size = max(28, int(40 * scale / 3.5))
+                font = None
+                for fp in [
+                    "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+                    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+                    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+                    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+                ]:
+                    try:
+                        font = ImageFont.truetype(fp, font_size)
+                        break
+                    except (OSError, IOError):
+                        continue
+                if font is None:
+                    try:
+                        font = ImageFont.load_default()
+                    except Exception:
+                        font = None
+
+                # 배너 높이 = 글자 크기 + 최소 패딩만
+                banner_h = font_size + 8
+
+                banner = Image.new('RGBA', (img_w, banner_h), (245, 245, 245, 240))
+                draw = ImageDraw.Draw(banner)
+
+                # 하단 빨간 라인
+                draw.rectangle([(0, banner_h - 2), (img_w, banner_h)], fill=(220, 50, 50))
+
+                x = 8
+                y = 3
+
+                # P번호
+                p_label = f"P{pn}"
+                draw.text((x, y), p_label, fill=(30, 60, 160), font=font)
+                if font:
+                    bbox = font.getbbox(p_label)
+                    x += bbox[2] - bbox[0] + 10
+                else:
+                    x += 30
+
+                draw.text((x, y), "—", fill=(150, 150, 150), font=font)
+                if font:
+                    bbox = font.getbbox("—")
+                    x += bbox[2] - bbox[0] + 10
+                else:
+                    x += 20
+
+                kw_stats = page_kw_stats.get(pn, {})
+                for ki, kw in enumerate(keywords):
+                    s = kw_stats.get(kw, {"match": 0, "mismatch": 0})
+
+                    # 키워드
+                    draw.text((x, y), kw, fill=(40, 40, 40), font=font)
+                    if font:
+                        bbox = font.getbbox(kw)
+                        x += bbox[2] - bbox[0] + 6
+
+                    # 일치
+                    ml = f"일치{s['match']}"
+                    draw.text((x, y), ml, fill=(30, 130, 30), font=font)
+                    if font:
+                        bbox = font.getbbox(ml)
+                        x += bbox[2] - bbox[0] + 6
+
+                    # 불일치
+                    mml = f"불일치{s['mismatch']}"
+                    draw.text((x, y), mml, fill=(210, 30, 30), font=font)
+                    if font:
+                        bbox = font.getbbox(mml)
+                        x += bbox[2] - bbox[0] + 16
+
+                    if ki < len(keywords) - 1:
+                        draw.text((x, y), "|", fill=(180, 180, 180), font=font)
+                        if font:
+                            bbox = font.getbbox("|")
+                            x += bbox[2] - bbox[0] + 10
+
+                # 합성
+                img_rgba = img.convert('RGBA')
+                combined = Image.new('RGBA', (img_w, img_rgba.height + banner_h))
+                combined.paste(banner, (0, 0))
+                combined.paste(img_rgba, (0, banner_h))
+                combined_rgb = combined.convert('RGB')
+
+                buf = _io.BytesIO()
+                combined_rgb.save(buf, format='PNG')
+                png_bytes = buf.getvalue()
+
+            except ImportError:
+                png_bytes = pix.tobytes("png")
+
+            snapshots.append((pn, png_bytes))
+
+    finally:
+        doc.close()
+
+    return snapshots
